@@ -136,7 +136,10 @@ def _grid(sessions: dict, target: str, year: int, rnd: int) -> pd.Series | None:
         return None
     if not pdata.is_settled(sessions[name]) and not pdata.session_finished(session):
         return None  # still running: a partial classification (e.g. after Q1) isn't the grid
-    pos = session.results.set_index("Abbreviation")["Position"].dropna()
+    try:
+        pos = session.results.set_index("Abbreviation")["Position"].dropna()
+    except Exception:  # results not available yet
+        return None
     return pos if len(pos) >= 10 else None
 
 

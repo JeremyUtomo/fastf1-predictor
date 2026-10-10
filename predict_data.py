@@ -205,7 +205,10 @@ def load_weekend_session(year: int, round_number: int, name: str, laps: bool,
 
 def session_finished(session) -> bool:
     """True once the official session status says it's over (results are final)."""
-    status = getattr(session, "session_status", None)
+    try:
+        status = session.session_status
+    except Exception:  # not published yet (e.g. session still running): not finished
+        return False
     return status is not None and status["Status"].isin(["Finished", "Finalised", "Ends"]).any()
 
 
