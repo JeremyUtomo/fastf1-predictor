@@ -73,3 +73,11 @@ def sidebar_brand() -> None:
         '<div class="sidebar-brand"><span class="dot"></span>FastF1 Explorer</div>'
         '<div class="sidebar-sub">Formula 1 timing, telemetry and predictions</div>',
         unsafe_allow_html=True)
+
+
+ROW_HEIGHT = 34  # px; set explicitly so table heights don't depend on the font size
+
+
+def table_height(rows: int, cap: int = 900) -> int:
+    """Height that fits `rows` data rows plus the header exactly (no empty rows)."""
+    return min(cap, (rows + 1) * ROW_HEIGHT + 3)

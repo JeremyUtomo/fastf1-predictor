@@ -13,6 +13,7 @@ import charts
 import data
 import model
 import predict_data as pdata
+import ui
 import upgrades
 
 # Heuristic factors (not fitted - there is too little sprint/wet data to fit them)
@@ -434,7 +435,7 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
     with left:
         pct_cols = MARKETS + ["DNF", "Win before quali"]
         st.dataframe(_as_pct(result, pct_cols), hide_index=True, width="stretch",
-                     height=min(820, 36 * len(result) + 40),
+                     height=ui.table_height(len(result)), row_height=ui.ROW_HEIGHT,
                      column_config={**_pct(result, pct_cols),
                                     "Change": st.column_config.NumberColumn(
                                         "Win Δ (pp)", format="%+.0f",
@@ -814,7 +815,7 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
     left, right = st.columns([3, 2])
     with left:
         st.dataframe(_as_pct(result, QUALI_MARKETS), hide_index=True, width="stretch",
-                     height=min(820, 36 * len(result) + 40),
+                     height=ui.table_height(len(result)), row_height=ui.ROW_HEIGHT,
                      column_config={**_pct(result, QUALI_MARKETS),
                                     "Expected pos.": st.column_config.NumberColumn(format="%.1f"),
                                     "Fair odds (pole)": st.column_config.NumberColumn(format="%.1f")})

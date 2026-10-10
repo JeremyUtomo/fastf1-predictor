@@ -147,7 +147,7 @@ def tab_overview(session, kind: str):
         show = show.assign(_s=res["Abbreviation"].map(best)).sort_values("_s").drop(columns="_s")
         show["Pos"] = range(1, len(show) + 1)
     show = show.dropna(axis=1, how="all")
-    st.dataframe(show, hide_index=True, width="stretch", height=min(760, 38 * len(show) + 40),
+    st.dataframe(show, hide_index=True, width="stretch", height=ui.table_height(len(show)), row_height=ui.ROW_HEIGHT,
                  column_config={"Photo": st.column_config.ImageColumn("", width="small"),
                                 "Pos": st.column_config.NumberColumn(format="%d")})
 
