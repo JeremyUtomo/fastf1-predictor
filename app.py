@@ -10,6 +10,7 @@ import streamlit as st
 import charts
 import data
 import predict_tab
+import track_record
 import ui
 
 st.set_page_config(page_title="FastF1 Explorer", page_icon=":material/speed:", layout="wide")
@@ -362,6 +363,11 @@ def predictions_page():
     predict_tab.render()
 
 
+def track_record_page():
+    ui.page_header("Track record")
+    track_record.render()
+
+
 def session_page():
     sel = sidebar()
     key = (sel["year"], sel["round"], sel["session"], sel["telemetry"])
@@ -421,5 +427,6 @@ def session_page():
 st.navigation([
     st.Page(season_page, title="Season", url_path="season"),
     st.Page(predictions_page, title="Predictions", url_path="predictions"),
+    st.Page(track_record_page, title="Track record", url_path="track-record"),
     st.Page(session_page, title="Session analysis", url_path="session"),
 ], position="top").run()

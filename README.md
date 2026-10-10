@@ -40,6 +40,7 @@ results and practice data.
 | --- | --- |
 | Season | Calendar and driver / constructor standings |
 | Predictions | Qualifying, sprint and race probabilities, results vs. prediction, comparison with bookmaker odds |
+| Track record | Saved predictions scored against results, and what the model learned (calibration) |
 | Session analysis | Pick a session in the sidebar: Overview, Laps, Strategy, Telemetry, Weather, Race control and Data tabs |
 
 ## Predictions
@@ -79,6 +80,25 @@ qualifying the model is about as good as trusting the grid for winner and
 podium markets and clearly better for the rest of the order. Before
 qualifying it is less accurate. Bookmaker odds include a margin, so don't
 expect these numbers to beat them reliably.
+
+### Learning from results
+
+The model improves as the season goes on in two ways:
+
+- **Retraining**: every prediction is fitted on all events before it, so each new
+  result is automatically part of the next prediction.
+- **Self-calibration**: every event of the last seasons is re-predicted using only
+  earlier data and compared with what happened. From that the model learns, per
+  session type, whether it was too cautious or too confident, and corrects its
+  probabilities (shrunk towards no correction while there are few events). This
+  is recalculated after every new result. Currently: qualifying needs no
+  correction, races are sharpened slightly, sprints considerably (they're more
+  predictable than a full race).
+
+Predictions shown before a session starts are saved to
+`~/.cache/fastf1/dashboard/prediction_log.csv`. The **Track record** page scores
+them against the real results and shows a calibration chart (does a predicted 30%
+happen about 30% of the time?).
 
 ### Declared upgrades
 

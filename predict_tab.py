@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+import calibration
 import charts
 import data
 import model
@@ -17,7 +18,6 @@ import ui
 import upgrades
 
 # Heuristic factors (not fitted - there is too little sprint/wet data to fit them)
-SPRINT_RANDOMNESS = 0.85   # shorter race, fewer strategy swings
 SPRINT_DNF = 0.4           # roughly a third of the distance
 RAIN_RANDOMNESS = 0.35     # +35% randomness at 100% rain probability
 RAIN_DNF = 0.25            # +25% retirement chance at 100% rain probability
@@ -369,9 +369,10 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
     shift = edited["Adjust (places)"].to_numpy(float) \
         + entries["driverId"].map(wet_gain).fillna(0.0).to_numpy() * rain
     p_dnf = feats["p_dnf"].to_numpy()[keep] * (1 + RAIN_DNF * rain)
-    randomness = chaos * (1 + RAIN_RANDOMNESS * rain)
+    calib = _temperatures(year, rnd)["sprint" if target == "Sprint" else "race"]
+    randomness = chaos * (1 + RAIN_RANDOMNESS * rain) * calib["temperature"]
     if target == "Sprint":
-        p_dnf, randomness = p_dnf * SPRINT_DNF, randomness * SPRINT_RANDOMNESS
+        p_dnf = p_dnf * SPRINT_DNF
     drivers = list(entries["Driver"][keep])
 
     def run(how: str):
@@ -419,13 +420,17 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
     result["Fair odds (win)"] = (1 / result["Win"]).where(result["Win"] > 0.001)
     result = result.sort_values("Win", ascending=False).reset_index(drop=True)
 
+    if start is not None and start > now:
+        calibration.log_prediction(year, rnd, event["EventName"], target, mode, result,
+                                   "Win", "Podium")
     actual = _results(sessions, target, year, rnd, races)
     if actual is not None:
         result = _with_result(result, actual)
 
     # --------------------------------------------------------------- output
     st.markdown(f"#### {event['EventName']} · {target}")
-    st.caption(f"Prediction {mode} · {len(pos):,} simulated races · trained on {fit.n_races} races")
+    st.caption(f"Prediction {mode} · {len(pos):,} simulated races · trained on {fit.n_races} races"
+               + _calib_note(calib, "sprints" if target == "Sprint" else "races"))
     if actual is not None:
         _result_check(result, actual, "Win", "Podium", "winner", entries, key=target)
     if "Change" in result:
@@ -637,8 +642,9 @@ def _explain(fit, X: pd.DataFrame, feats: pd.DataFrame, entries: pd.DataFrame,
             + (f", wet record shifts drivers by up to "
                f"{(wet_gain.abs().max() if len(wet_gain) else 0) * rain:.1f} places"
                f" (based on {st.session_state.get('n_wet_races', 0)} wet races)" if len(wet_gain) else "")
-            + (f"; sprint: randomness ×{SPRINT_RANDOMNESS}, retirements ×{SPRINT_DNF}"
-               if target == "Sprint" else "") + ". These factors are rules of thumb, not fitted.")
+            + (f"; sprint retirements ×{SPRINT_DNF}" if target == "Sprint" else "")
+            + ". Rain factors are rules of thumb; the overall confidence is learned from past "
+              "results (see the Track record page).")
         if sq is not None:
             st.markdown("**Grid estimate**: no qualifying yet, so each driver's qualifying "
                         "position is estimated from this weekend's Sprint Qualifying and recent "
@@ -798,21 +804,27 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
         X[col] = X[col] - shift
     fit = _quali_fit(year, rnd, variant)
     drivers = list(entries["Driver"][keep])
+    calib = _temperatures(year, rnd)["quali"]
     pos = model.simulate_rank(fit.strength(X)[keep], np.zeros(int(keep.sum())),
-                              randomness=1 + RAIN_RANDOMNESS * rain)
+                              randomness=(1 + RAIN_RANDOMNESS * rain) * calib["temperature"])
     result = pd.DataFrame({"Driver": drivers, "Team": list(entries["Team"][keep]),
                            "Pole": (pos == 1).mean(0), "Front row": (pos <= 2).mean(0),
                            "Top 3": (pos <= 3).mean(0), "Q3 (top 10)": (pos <= 10).mean(0),
                            "Q2 (top 15)": (pos <= 15).mean(0), "Expected pos.": pos.mean(0)})
     result["Fair odds (pole)"] = (1 / result["Pole"]).where(result["Pole"] > 0.001)
     result = result.sort_values("Pole", ascending=False).reset_index(drop=True)
+    if start > now:
+        calibration.log_prediction(year, rnd, event["EventName"], "Qualifying",
+                                   f"form + {source}" if variant != "form" else "form only",
+                                   result, "Pole", "Top 3")
     actual = _results(sessions, "Qualifying", year, rnd)
     if actual is not None:
         result = _with_result(result, actual)
 
     st.markdown(f"#### {event['EventName']} · Qualifying")
     st.caption(f"Based on recent form{' and ' + source if variant != 'form' else ''} · "
-               f"{len(pos):,} simulated sessions · trained on {fit.n_races} sessions")
+               f"{len(pos):,} simulated sessions · trained on {fit.n_races} sessions"
+               + _calib_note(calib, "qualifying sessions"))
     if actual is not None:
         _result_check(result, actual, "Pole", "Top 3", "pole", entries, key="quali")
     left, right = st.columns([3, 2])
@@ -976,6 +988,36 @@ def _results(sessions: dict, name: str, year: int, rnd: int,
         return None
     out["classified"] = out["Result"].str.startswith("P")
     return out
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _temperatures(year: int, rnd: int) -> dict:
+    """Confidence correction per session type, learned from past predictions vs results."""
+    return _calibration_data(year, rnd)[0]
+
+
+@st.cache_resource(show_spinner=False, max_entries=4)
+def _calibration_data(year: int, rnd: int):
+    _, hist, _ = _prepared(year, rnd)
+    qrows = _quali_data(year, rnd)
+    years = range(year - pdata.HISTORY_SEASONS + 1, year + 1)
+    sprints = pd.concat([pdata.season_sprints(y) for y in years], ignore_index=True)
+    text = "Learning from past predictions vs. results (first time ~1–2 min)…"
+    bar = st.progress(0.0, text=text)
+    events = calibration.walk_forward_events(hist, qrows, sprints, (year, rnd),
+                                             progress=lambda f: bar.progress(f, text=text))
+    bar.empty()
+    return calibration.temperatures(events), events
+
+
+def _calib_note(calib: dict, what: str) -> str:
+    if not calib.get("learned"):
+        return ""
+    t = calib["temperature"]
+    if abs(t - 1) < 0.03:
+        return f" · calibration from {calib['n']} past {what}: no correction needed"
+    direction = "sharpened" if t < 1 else "widened"
+    return f" · {direction} by {abs(1 / t - 1):.0%} based on {calib['n']} past {what}"
 
 
 def _with_result(result: pd.DataFrame, actual: pd.DataFrame) -> pd.DataFrame:
