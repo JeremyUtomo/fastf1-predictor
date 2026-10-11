@@ -14,22 +14,19 @@ Prediction log
 """
 from __future__ import annotations
 
-import pickle
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 import data
-import model
 
 _DIR = data._CACHE_DIR / "dashboard"
 _DIR.mkdir(parents=True, exist_ok=True)
-EVENTS_FILE = _DIR / "calibration_events.pkl"
 LOG_FILE = _DIR / "prediction_log.csv"
 
 KINDS = ("quali", "sprint", "race")
-DEFAULT_TEMPERATURE = {"quali": 1.0, "sprint": 0.85, "race": 1.0}
+DEFAULT_TEMPERATURE = {"quali": 1.0, "sprint": 0.85, "race": 1.0, "race_pre": 1.0}
 TEMPS = np.round(np.arange(0.5, 2.01, 0.05), 2)
 SHRINK = 5           # events needed before the learned value counts half
 MIN_EVENTS = 6
@@ -37,69 +34,17 @@ SEASONS_BACK = 2     # learn from the current and the two previous seasons
 
 
 # ------------------------------------------------------------ re-predictions
-def _load_events() -> list[dict]:
-    try:
-        return pickle.loads(EVENTS_FILE.read_bytes())
-    except (OSError, pickle.PickleError, EOFError):
-        return []
+def walk_forward_events(D: dict, until: tuple[int, int], progress=None) -> list[dict]:
+    """Walk-forward re-predictions of all events before `until`.
 
-
-def walk_forward_events(hist: pd.DataFrame, qrows: pd.DataFrame, sprints: pd.DataFrame,
-                        until: tuple[int, int], progress=None) -> list[dict]:
-    """Walk-forward re-predictions of all events before `until` (cached on disk).
-
-    Each event stores the model strengths (before temperature) and which driver
-    actually won / took pole, which is all that's needed to learn a temperature.
+    They live in the backtest store of `evaluate.py` (computed once, then only new
+    events are added), so calibration and the Track record page use the same data.
     """
-    events = _load_events()
-    have = {(e["kind"], e["season"], e["round"]) for e in events}
+    import evaluate
+
     first = until[0] - SEASONS_BACK
-    keys = (hist[hist["season"] >= first][["season", "round"]].drop_duplicates()
-            .sort_values(["season", "round"]))
-    todo = [(int(s), int(r)) for s, r in keys.itertuples(index=False)
-            if (s, r) < until and any((k, s, r) not in have for k in KINDS)]
-    added = False
-    for i, (season, rnd) in enumerate(todo):
-        if progress:
-            progress((i + 1) / len(todo))
-        before = (hist["season"] < season) | ((hist["season"] == season) & (hist["round"] < rnd))
-        past = hist[before]
-        if past.groupby(["season", "round"]).ngroups < 10:
-            continue
-        race = hist[(hist["season"] == season) & (hist["round"] == rnd) & hist["started"]]
-        fit = None
-        if ("race", season, rnd) not in have and (race["finish"] == 1).any():
-            fit = model.fit_rank(past, model.FEATURES_POST)
-            events.append(dict(kind="race", season=season, round=rnd,
-                               strength=fit.strength(race) / race["chaos"].to_numpy(),
-                               drivers=list(race["driverId"]),
-                               first=int(np.argmax(race["finish"].to_numpy() == 1))))
-        sp = sprints[(sprints["season"] == season) & (sprints["round"] == rnd)]
-        if ("sprint", season, rnd) not in have and len(sp) >= 15:
-            x = race.merge(sp[["driverId", "sq", "sprint"]], on="driverId")
-            x = x[x["sq"] > 0]
-            if (x["sprint"] == 1).any():
-                fit = fit or model.fit_rank(past, model.FEATURES_POST)
-                x = x.assign(grid=x["sq"].astype(float), grid_log=np.log(x["sq"].astype(float)))
-                events.append(dict(kind="sprint", season=season, round=rnd,
-                                   strength=fit.strength(x) / x["chaos"].to_numpy(),
-                                   drivers=list(x["driverId"]),
-                                   first=int(np.argmax(x["sprint"].to_numpy() == 1))))
-        wk = qrows[(qrows["season"] == season) & (qrows["round"] == rnd)]
-        if ("quali", season, rnd) not in have and len(wk) >= 15:
-            feats = model.QUALI_VARIANTS[model.weekend_variant(wk)]
-            qbefore = (qrows["season"] < season) | ((qrows["season"] == season) & (qrows["round"] < rnd))
-            train = qrows[qbefore].dropna(subset=feats)
-            if train.groupby(["season", "round"]).ngroups >= 8:
-                f = model.fit_rank(train, feats)
-                events.append(dict(kind="quali", season=season, round=rnd,
-                                   strength=f.strength(model.fill_missing(wk, feats)),
-                                   drivers=list(wk["driverId"]),
-                                   first=int(np.argmin(wk["finish"].to_numpy()))))
-        added = True
-    if added:
-        EVENTS_FILE.write_bytes(pickle.dumps(events))
-    return [e for e in events if (e["season"], e["round"]) < until and e["season"] >= first]
+    return [e for e in evaluate.update_store(D, until=until, progress=progress)
+            if e["season"] >= first]
 
 
 def _first_logp(strength: np.ndarray, idx: int, temp: float) -> float:
@@ -114,10 +59,10 @@ def win_probs(strength: np.ndarray, temp: float) -> np.ndarray:
     return e / e.sum()
 
 
-def temperatures(events: list[dict]) -> dict[str, dict]:
+def temperatures(events: list[dict], kinds=KINDS) -> dict[str, dict]:
     """Learned temperature per session type, with the evidence behind it."""
     out = {}
-    for kind in KINDS:
+    for kind in kinds:
         ev = [e for e in events if e["kind"] == kind]
         default = DEFAULT_TEMPERATURE[kind]
         if len(ev) < MIN_EVENTS:
@@ -139,6 +84,8 @@ def calibration_table(events: list[dict], temps: dict[str, dict], bins=(0, .05, 
     """Predicted win/pole chance vs. how often it happened, over all re-predicted events."""
     rows = []
     for e in events:
+        if e["kind"] not in temps:
+            continue
         p = win_probs(e["strength"], temps[e["kind"]]["temperature"])
         for i, pi in enumerate(p):
             rows.append(dict(kind=e["kind"], p=pi, hit=float(i == e["first"])))

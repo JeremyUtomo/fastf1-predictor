@@ -8,10 +8,26 @@ import streamlit as st
 
 import calibration
 import data
+import evaluate
 import predict_data as pdata
 import predict_tab
 
 KIND_LABEL = {"quali": "Qualifying", "sprint": "Sprint", "race": "Race"}
+BACKTEST_KINDS = {"Qualifying": "quali", "Race (after qualifying)": "race",
+                  "Race (before qualifying)": "race_pre", "Sprint": "sprint"}
+# approximate team colours, so drivers keep a consistent colour in historical charts
+TEAM_COLORS = {"mercedes": "27F4D2", "red_bull": "3671C6", "ferrari": "E8002D",
+               "mclaren": "FF8000", "aston_martin": "229971", "alpine": "0093CC",
+               "williams": "64C4FF", "rb": "6692FF", "alphatauri": "5E8FAA",
+               "toro_rosso": "469BFF", "sauber": "52E252", "alfa": "C92D4B", "haas": "B6BABD",
+               "racing_point": "F596C8", "force_india": "F596C8", "renault": "FFF500",
+               "audi": "BB0A30", "cadillac": "909090"}
+TEAM_NAMES = {"red_bull": "Red Bull", "rb": "RB", "mclaren": "McLaren", "alphatauri": "AlphaTauri",
+              "toro_rosso": "Toro Rosso", "alfa": "Alfa Romeo", "force_india": "Force India"}
+
+
+def _team_name(cid: str) -> str:
+    return TEAM_NAMES.get(cid, str(cid).replace("_", " ").title())
 
 
 def _score_log() -> pd.DataFrame:
@@ -83,6 +99,8 @@ def render() -> None:
                      column_config={"Model gave": st.column_config.NumberColumn(format="percent"),
                                     "Log loss": st.column_config.NumberColumn(format="%.2f")})
 
+    _backtest_section()
+
     # ------------------------------------------------------------ calibration
     st.markdown("##### What the model learned from past results")
     st.caption("Every event of the last seasons is re-predicted using only data from before "
@@ -135,3 +153,73 @@ def render() -> None:
                          hide_index=True, width="stretch",
                          column_config={"Predicted": st.column_config.NumberColumn(format="percent"),
                                         "Happened": st.column_config.NumberColumn(format="percent")})
+
+
+def _event_names(season: int) -> dict:
+    try:
+        sched = data.get_schedule(season)
+        return dict(zip(sched["RoundNumber"].astype(int), sched["EventName"]))
+    except Exception:
+        return {}
+
+
+def _backtest_section() -> None:
+    st.markdown("##### Backtest: predictions vs. results since 2020")
+    st.caption("Every qualifying session, sprint and race since 2020 was predicted using only "
+               "data from before it (what the model would have said at the time, including the "
+               "confidence correction learned from earlier seasons) and compared with the real "
+               "result.")
+    events = evaluate.load_store()
+    if not events:
+        st.info("The backtest hasn't been computed yet; open the Predictions page once.")
+        return
+    label = st.segmented_control("Session type", list(BACKTEST_KINDS), default="Race (after qualifying)",
+                                 key="bt_kind", label_visibility="collapsed")
+    kind = BACKTEST_KINDS[label or "Race (after qualifying)"]
+    evs = sorted((e for e in events if e["kind"] == kind),
+                 key=lambda e: (e["season"], e["round"]), reverse=True)
+    if not evs:
+        st.info("No events of this type.")
+        return
+
+    summary = evaluate.season_summary(evs)
+    overall = evaluate.season_summary([{**e, "season": 0} for e in evs])
+    table = pd.concat([summary, overall]).drop(columns="kind")
+    table["season"] = table["season"].map(lambda v: "All" if v == 0 else str(int(v)))
+    st.dataframe(
+        table.rename(columns={"season": "Season", "events": "Events", "fav_hit": "Favourite won",
+                              "top3_hits": "Top 3 correct", "logloss": "Log loss ↓",
+                              "spearman": "Order correlation", "pos_mae": "Position error ↓"}),
+        hide_index=True, width="stretch",
+        column_config={"Favourite won": st.column_config.NumberColumn(format="percent"),
+                       "Top 3 correct": st.column_config.NumberColumn(format="%.2f"),
+                       "Log loss ↓": st.column_config.NumberColumn(format="%.3f"),
+                       "Order correlation": st.column_config.NumberColumn(format="%.2f"),
+                       "Position error ↓": st.column_config.NumberColumn(format="%.2f")})
+
+    names = {s: _event_names(s) for s in {e["season"] for e in evs}}
+    pick = st.selectbox(
+        "Event", range(len(evs)), key=f"bt_event_{kind}",
+        format_func=lambda i: f"{evs[i]['season']} R{evs[i]['round']} · "
+                              f"{names[evs[i]['season']].get(evs[i]['round'], evs[i]['circuit'])}")
+    e = evs[pick]
+    prefix = "cal_" if "cal_p_first" in e else ""
+    first_col, top3_col = ("Pole", "Top 3") if kind == "quali" else ("Win", "Podium")
+    codes = [c if isinstance(c, str) and c else d for c, d in zip(e["codes"], e["drivers"])]
+    result = pd.DataFrame({"Driver": codes, "Team": [_team_name(t) for t in e["teams"]],
+                           first_col: e[prefix + "p_first"], top3_col: e[prefix + "p_top3"],
+                           "Expected pos.": e[prefix + "exp_pos"]})
+    labels = [f"P{int(f)}" if c else "DNF" for f, c in zip(e["finish"], e["classified"])]
+    actual = pd.DataFrame({"Driver": codes, "Pos": e["finish"], "Result": labels,
+                           "classified": e["classified"]})
+    result = result.sort_values(first_col, ascending=False).reset_index(drop=True)
+    entries = pd.DataFrame({"Driver": codes,
+                            "TeamColor": [TEAM_COLORS.get(t, "") for t in e["teams"]]})
+    predict_tab._result_check(result, actual, first_col, top3_col,
+                              "pole" if kind == "quali" else "winner", entries, key=f"bt_{kind}")
+    shown = predict_tab._with_result(result, actual)
+    st.dataframe(predict_tab._as_pct(shown, [first_col, top3_col]), hide_index=True,
+                 width="stretch", height=predict_tab.ui.table_height(len(shown)),
+                 row_height=predict_tab.ui.ROW_HEIGHT,
+                 column_config={**predict_tab._pct(shown, [first_col, top3_col]),
+                                "Expected pos.": st.column_config.NumberColumn(format="%.1f")})

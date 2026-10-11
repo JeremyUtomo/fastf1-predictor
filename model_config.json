@@ -1,0 +1,61 @@
+{
+  "race_post": {
+    "features": [
+      "grid",
+      "grid_log",
+      "form",
+      "quali_form",
+      "team_pace",
+      "team_trend",
+      "circuit_aff",
+      "driver_edge",
+      "quali_gap",
+      "team_gap",
+      "race_pace"
+    ],
+    "top_k": 3,
+    "l2": 1.0,
+    "half_life": null,
+    "train_seasons": 4
+  },
+  "race_pre": {
+    "features": [
+      "form",
+      "quali_form",
+      "team_pace",
+      "team_trend",
+      "circuit_aff",
+      "driver_edge",
+      "quali_gap",
+      "team_gap",
+      "race_pace"
+    ],
+    "top_k": 3,
+    "l2": 1.0,
+    "half_life": null,
+    "train_seasons": 4
+  },
+  "quali": {
+    "base": [
+      "quali_form",
+      "team_pace",
+      "team_trend",
+      "form",
+      "circuit_aff",
+      "driver_edge",
+      "quali_gap",
+      "team_gap"
+    ],
+    "practice": "fp",
+    "top_k": 5,
+    "l2": 0.3,
+    "half_life": null,
+    "train_seasons": 6
+  },
+  "_meta": {
+    "created": "2026-10-11 01:36 UTC",
+    "tuned_on": "2020\u20132025",
+    "holdout": 2026,
+    "note": "Written by `python evaluate.py --tune`. Re-run to re-tune."
+  }
+}

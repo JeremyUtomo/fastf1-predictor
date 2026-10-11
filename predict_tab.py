@@ -12,6 +12,7 @@ import streamlit as st
 import calibration
 import charts
 import data
+import evaluate
 import model
 import predict_data as pdata
 import ui
@@ -51,7 +52,7 @@ def _quali_name(sessions: dict, target: str) -> str | None:
 
 @st.cache_resource(show_spinner=False, max_entries=6)
 def _prepared(year: int, rnd: int):
-    races, quali = pdata.history(year)
+    races, quali = pdata.history(year, start=pdata.DATA_START)
     hist, builder = model.build_history(races, quali, stop_before=(year, rnd))
     return races, hist, builder
 
@@ -59,32 +60,23 @@ def _prepared(year: int, rnd: int):
 @st.cache_resource(show_spinner=False, max_entries=6)
 def _grid_estimator(year: int, rnd: int):
     """Qualifying ~ Sprint Qualifying + recent quali form, fitted on past sprint weekends."""
-    _, quali = pdata.history(year)
+    _, quali = pdata.history(year, start=pdata.DATA_START)
     _, hist, _ = _prepared(year, rnd)
-    years = range(year - pdata.HISTORY_SEASONS + 1, year + 1)
-    sprints = pd.concat([pdata.season_sprints(y) for y in years], ignore_index=True)
+    sprints = pdata.sprints_range(pdata.DATA_START, year)
     sprints = sprints[(sprints["season"] < year) | (sprints["round"] < rnd)]
     return model.fit_grid_estimate(hist, sprints, quali)
 
 
 @st.cache_resource(show_spinner=False, max_entries=6)
 def _fits(year: int, rnd: int):
+    """Race model after qualifying, before qualifying, and for sprints (settings from
+    model_config.json, chosen by `python evaluate.py --tune`)."""
     _, hist, _ = _prepared(year, rnd)
-    return model.fit_rank(hist, model.FEATURES_POST), model.fit_rank(hist, model.FEATURES_PRE)
-
-
-@st.cache_data(show_spinner=False, max_entries=6)
-def _backtest(year: int, rnd: int) -> pd.DataFrame:
-    _, hist, _ = _prepared(year, rnd)
-    season = year if (hist["season"] == year).any() else year - 1
-    post = model.backtest(hist, season)
-    pre = model.backtest(hist, season, features=model.FEATURES_PRE)
-    post["model"] = post["model"].map({"model": "This model, after qualifying",
-                                       "grid only": "Grid order only (baseline)"})
-    pre = pre[pre["model"] == "model"].assign(model="This model, before qualifying")
-    out = pd.concat([post, pre])
-    out["season"] = season
-    return out
+    sprint_feats = [f for f in model.CONFIG["race_post"]["features"] if f != "qgap_now"]
+    return (model.fit_family(hist, "race_post", year, rnd),
+            model.fit_family(hist, "race_pre", year, rnd),
+            model.fit_family(hist, "race_post", year, rnd, features=sprint_feats),
+            model.qgap_lookup(hist))
 
 
 def _id_maps(races: pd.DataFrame) -> tuple[dict, dict]:
@@ -123,6 +115,19 @@ def _entries(event, sessions: dict, year: int, rnd: int, races: pd.DataFrame) ->
                          "TeamColor": "", "LastName": last["familyName"],
                          "driverId": last["driverId"],
                          "constructorId": last["constructorId"]}).reset_index(drop=True)
+
+
+def _quali_gaps(sessions: dict, target: str, year: int, rnd: int) -> pd.Series | None:
+    """This weekend's qualifying gap to pole (%), abbreviation-indexed, once it's final."""
+    name = _quali_name(sessions, target)
+    if _grid(sessions, target, year, rnd) is None:
+        return None
+    try:
+        res = pdata.load_weekend_session(year, rnd, name, True, sessions[name]).results
+        best = res.set_index("Abbreviation")[["Q1", "Q2", "Q3"]].min(axis=1)
+        return pdata._gap_pct(best)
+    except Exception:
+        return None
 
 
 def _grid(sessions: dict, target: str, year: int, rnd: int) -> pd.Series | None:
@@ -252,8 +257,9 @@ def render() -> None:
         st.write("")
         if st.button("Refresh data", help="Re-download results; use after a session has finished."):
             for fn in (pdata.season_races, pdata.season_quali, pdata.season_sprints,
-                       pdata.weekend_session, pdata._fresh_session, _prepared, _fits, _backtest,
-                       _grid_estimator, _quali_data, _quali_fit, _quali_backtest):
+                       pdata.weekend_session, pdata._fresh_session, _prepared, _fits,
+                       _grid_estimator, _quali_data, _quali_fit, _calibration_data,
+                       _temperatures):
                 fn.clear()
             st.rerun()
 
@@ -284,7 +290,9 @@ def render() -> None:
 def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races: pd.DataFrame,
                  hist: pd.DataFrame, builder, info: dict, entries: pd.DataFrame) -> None:
     now = data.now_utc()
-    fit_post, fit_pre = _fits(year, rnd)
+    fit_post, fit_pre, fit_sprint, lookup = _fits(year, rnd)
+    if target == "Sprint":
+        fit_post = fit_sprint
     circuit = info["circuitId"]
     quali_name = _quali_name(sessions, target)
     grid = _grid(sessions, target, year, rnd)
@@ -375,13 +383,18 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
         p_dnf = p_dnf * SPRINT_DNF
     drivers = list(entries["Driver"][keep])
 
+    qgaps = _quali_gaps(sessions, target, year, rnd) if grid is not None else None
+
     def run(how: str):
         """Simulate with the known grid ("grid"), a Sprint-Qualifying-based estimate
         ("estimate") or without any grid ("pre"). Returns (fit, features, positions)."""
         X = feats.copy()
         if how == "grid":
-            g = np.clip(edited["Grid"].to_numpy(float) - shift, 1, 22)
-            X["grid"], X["grid_log"] = g, np.log(g)
+            g = edited["Grid"].to_numpy(float) - shift
+            qg = entries["Driver"].map(qgaps).to_numpy(float) if qgaps is not None else None
+            X = model.with_grid(X, g, chaos, qgap=qg, qgap_lookup=lookup)
+            if qg is not None:  # drivers without a time: typical gap for their grid slot
+                X["qgap_now"] = np.where(np.isnan(qg), lookup(X["grid"].to_numpy()), qg)
             return fit_post, X, model.simulate_rank(fit_post.strength(X)[keep], p_dnf, randomness)
         if how == "estimate":
             # Sprint Qualifying + recent form -> expected qualifying position; its
@@ -389,14 +402,14 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
             w, est_sd = estimator
             sq_pos = entries["Driver"].map(sq).fillna(21).to_numpy(float)
             est = w[0] + w[1] * sq_pos + w[2] * X["quali_form"].to_numpy() - shift
-            X["grid"], X["grid_log"] = est, np.log(np.clip(est, 1, 22))
-            return fit_post, X, model.simulate_uncertain_grid(fit_post, X[keep], est[keep],
-                                                              est_sd, p_dnf, randomness)
+            X = model.with_grid(X, est, chaos, qgap_lookup=lookup)
+            return fit_post, X, model.simulate_uncertain_grid(
+                fit_post, X[keep], est[keep], est_sd, p_dnf, randomness, chaos=chaos,
+                lookup=lookup)
         if fp_rank is not None:
             fp = entries["Driver"].map(fp_rank).fillna(X["quali_form"]).to_numpy()
             X["quali_form"] = (1 - FP_BLEND) * X["quali_form"] + FP_BLEND * fp
-        X["quali_form"] -= shift
-        X["form"] -= shift
+        X = _apply_shift(X, shift)
         return fit_pre, X, model.simulate_rank(fit_pre.strength(X)[keep], p_dnf, randomness)
 
     pre_how = "estimate" if sq is not None else "pre"
@@ -623,6 +636,9 @@ def _explain(fit, X: pd.DataFrame, feats: pd.DataFrame, entries: pd.DataFrame,
             "Grid used": X["grid"].round(1).values if "grid" in X else np.nan,
             "Recent finishes": feats["form"].round(1).values,
             "Recent quali": X["quali_form"].round(1).values,
+            "Quali gap %": X["quali_gap"].round(2).values,
+            "Driver edge %": feats["driver_edge"].round(2).values,
+            "Race pace %": X["race_pace"].round(2).values,
             "Team quali pace": feats["team_pace"].round(1).values,
             "Team trend /race": feats["team_trend"].round(2).values,
             "Circuit history": feats["circuit_aff"].round(2).values,
@@ -631,9 +647,11 @@ def _explain(fit, X: pd.DataFrame, feats: pd.DataFrame, entries: pd.DataFrame,
             "Wet gain": entries["driverId"].map(wet_gain).round(2).values,
             "Sprint quali": entries["Driver"].map(sq).values if sq is not None else np.nan,
         })
-        st.markdown("**Inputs per driver** (positions; lower = better, except *Wet gain*: "
-                    "places gained on the teammate in wet races vs. dry. *Team trend* < 0 = improving, e.g. upgrades. "
-                    "*Circuit history* < 0 = usually does better here than elsewhere.)")
+        st.markdown("**Inputs per driver** (positions and % gaps; lower = better, except "
+                    "*Driver edge*: % faster than the teammate in qualifying, i.e. driver skill "
+                    "separate from the car, and *Wet gain*: places gained on the teammate in wet "
+                    "races vs. dry. *Team trend* < 0 = improving. *Circuit history* < 0 = usually "
+                    "does better here than elsewhere.)")
         st.dataframe(shown, hide_index=True, width="stretch",
                      column_config={"Retire chance": st.column_config.NumberColumn(format="percent")})
         st.markdown(
@@ -657,53 +675,28 @@ def _explain(fit, X: pd.DataFrame, feats: pd.DataFrame, entries: pd.DataFrame,
             "degradation and strategy, grid penalties announced after qualifying, team orders, "
             "driver illness/injury, and specific safety-car probabilities.")
 
-    with st.expander("Model accuracy (walk-forward backtest)"):
-        with st.spinner("Re-predicting every race of the season using only earlier data…"):
-            bt = _backtest(year, rnd)
-        if bt.empty:
-            st.info("Not enough races yet to backtest.")
-            return
-        season = int(bt["season"].iloc[0])
-        summary = (bt.groupby("model")[["winner_logloss", "top_pick_won", "podium_brier", "pos_mae"]]
-                   .mean().reset_index().rename(columns={
-                       "model": "Approach", "winner_logloss": "Winner log-loss ↓",
-                       "top_pick_won": "Favourite won", "podium_brier": "Podium Brier ↓",
-                       "pos_mae": "Avg. position error ↓"}))
-        st.markdown(f"Every {season} race before this one was predicted using only data from "
-                    f"before it ({bt['round'].nunique()} races). Lower ↓ is better.")
-        st.dataframe(summary, hide_index=True, width="stretch",
-                     column_config={"Favourite won": st.column_config.NumberColumn(format="percent"),
-                                    "Winner log-loss ↓": st.column_config.NumberColumn(format="%.3f"),
-                                    "Podium Brier ↓": st.column_config.NumberColumn(format="%.3f"),
-                                    "Avg. position error ↓": st.column_config.NumberColumn(format="%.2f")})
-        st.markdown(
-            "**How to read this**: after qualifying, this model is about as good as simply "
-            "trusting the grid for picking the winner and podium, and clearly better at "
-            "predicting the rest of the order (head-to-heads, points finishes). Before "
-            "qualifying it is less accurate, as expected. Bookmakers use similar information plus "
-            "insider knowledge and price in a margin, so consistently beating their odds with "
-            "this model is unlikely. Treat the numbers as a second opinion, not a signal to bet.")
+    _accuracy_panel(year, rnd, ("sprint",) if target == "Sprint" else ("race", "race_pre"))
 
 
 # --------------------------------------------------------------- qualifying
 @st.cache_resource(show_spinner=False, max_entries=4)
 def _quali_data(year: int, rnd: int) -> pd.DataFrame:
     """Past qualifying entries with pre-weekend features and weekend signals."""
-    _, quali = pdata.history(year)
+    _, quali = pdata.history(year, start=pdata.DATA_START)
     _, hist, _ = _prepared(year, rnd)
-    years = range(year - pdata.HISTORY_SEASONS + 1, year + 1)
-    sprints = pd.concat([pdata.season_sprints(y) for y in years], ignore_index=True)
+    sprints = pdata.sprints_range(pdata.DATA_START, year)
     sprints = sprints[(sprints["season"] < year) | (sprints["round"] < rnd)]
     sprint_weekends = set(map(tuple, sprints[["season", "round"]].drop_duplicates().values))
-    weekends = hist[hist["season"] >= year - 2][["season", "round"]].drop_duplicates()
+    first = year - model.CONFIG["quali"]["train_seasons"] + 1
+    weekends = hist[hist["season"] >= first][["season", "round"]].drop_duplicates()
     fp = {}
     text = "Loading practice pace of past weekends (first time ~2 min)…"
     progress = st.progress(0.0, text=text)
     for i, (s, r) in enumerate(weekends.itertuples(index=False)):
         if (s, r) not in sprint_weekends:
-            rank = pdata.practice_rank(int(s), int(r), "Practice 3")
-            if rank is not None:
-                fp[(s, r)] = rank
+            pace = pdata.practice_pace(int(s), int(r), "Practice 3")
+            if pace is not None:
+                fp[(s, r)] = pace
         progress.progress((i + 1) / len(weekends), text=text)
     progress.empty()
     return model.quali_rows(hist, quali, sprints, fp)
@@ -711,19 +704,13 @@ def _quali_data(year: int, rnd: int) -> pd.DataFrame:
 
 @st.cache_resource(show_spinner=False, max_entries=12)
 def _quali_fit(year: int, rnd: int, variant: str):
-    feats = model.QUALI_VARIANTS[variant]
-    return model.fit_rank(_quali_data(year, rnd).dropna(subset=feats), feats)
+    return model.fit_family(_quali_data(year, rnd), "quali", year, rnd,
+                            features=model.quali_features(variant))
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
-def _quali_backtest(year: int, rnd: int) -> pd.DataFrame:
-    rows = _quali_data(year, rnd)
-    season = year if (rows["season"] == year).any() else year - 1
-    return pd.concat([model.quali_backtest(rows, s) for s in (season - 1, season)])
-
-
-def _weekend_signal(sessions: dict, year: int, rnd: int) -> tuple[str, pd.Series | None, str]:
-    """(model variant, abbreviation-indexed signal, source session) for this weekend."""
+def _weekend_signal(sessions: dict, year: int, rnd: int) -> tuple[str, object, str]:
+    """(model variant, abbreviation-indexed signal, source session) for this weekend:
+    Sprint Qualifying positions (Series) or practice rank and gap (DataFrame)."""
     now = data.now_utc()
     for name in ("Sprint Qualifying", "Sprint Shootout"):
         if name in sessions and sessions[name] < now:
@@ -736,9 +723,9 @@ def _weekend_signal(sessions: dict, year: int, rnd: int) -> tuple[str, pd.Series
                 laps = pdata.load_weekend_session(year, rnd, name, True, sessions[name]).laps
             except Exception:
                 continue
-            best = laps.dropna(subset=["LapTime"]).groupby("Driver")["LapTime"].min()
-            if len(best) >= 10:
-                return "practice", best.rank(), name
+            pace = pdata.laps_pace(laps)
+            if pace is not None:
+                return "practice", pace, name
     return "form", None, "no session yet"
 
 
@@ -792,16 +779,19 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
     keep = ~edited["Out"].to_numpy()
     shift = edited["Adjust (places)"].to_numpy(float)
 
-    feats = model.QUALI_VARIANTS[variant]
+    feats = model.quali_features(variant)
     X = pd.DataFrame([builder.features(d, t, info["circuitId"])
                       for d, t in zip(entries["driverId"], entries["constructorId"])])
-    weekend_col = {"sprint quali": "sq", "practice": "fp"}.get(variant)
-    X["sq"] = X["fp"] = np.nan
-    if weekend_col:
-        X[weekend_col] = entries["Driver"].map(signal).to_numpy()
+    weekend_col = {"sprint quali": "sq",
+                   "practice": model.CONFIG["quali"]["practice"]}.get(variant)
+    X["sq"] = X["fp"] = X["fp_gap"] = np.nan
+    if variant == "sprint quali":
+        X["sq"] = entries["Driver"].map(signal).to_numpy()
+    elif variant == "practice":
+        X["fp"] = entries["Driver"].map(signal["rank"]).to_numpy()
+        X["fp_gap"] = entries["Driver"].map(signal["gap"]).to_numpy()
     X = model.fill_missing(X, feats)
-    for col in ["quali_form", "form"] + ([weekend_col] if weekend_col else []):
-        X[col] = X[col] - shift
+    X = _apply_shift(X, shift, extra_rank=("sq", "fp"))
     fit = _quali_fit(year, rnd, variant)
     drivers = list(entries["Driver"][keep])
     calib = _temperatures(year, rnd)["quali"]
@@ -868,37 +858,9 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
                     "(rule of thumb). **Not in the model**: track evolution, red flags, "
                     "traffic, deleted laps, engine modes, set-up changes after practice.")
 
-    with st.expander("Model accuracy (walk-forward backtest)"):
-        with st.spinner("Re-predicting past qualifying sessions using only earlier data…"):
-            bt = _quali_backtest(year, rnd)
-        if bt.empty:
-            st.info("Not enough sessions to backtest.")
-            return
-        names = {"form": "Recent form only", "practice": "Form + practice pace",
-                 "sprint quali": "Form + Sprint Qualifying"}
-        kinds = {"practice": "Normal weekends", "sprint quali": "Sprint weekends",
-                 "form": "No weekend data"}
-        summary = (bt.assign(model=bt["model"].map(names), weekend=bt["weekend"].map(kinds))
-                   .groupby(["weekend", "model"])
-                   .agg(Sessions=("round", "size"),
-                        **{"Pole log-loss ↓": ("pole_logloss", "mean"),
-                           "Favourite took pole": ("fav_on_pole", "mean"),
-                           "Top-3 Brier ↓": ("top3_brier", "mean"),
-                           "Avg. position error ↓": ("pos_mae", "mean")})
-                   .reset_index().rename(columns={"weekend": "Weekend", "model": "Approach"}))
-        st.dataframe(summary, hide_index=True, width="stretch",
-                     column_config={
-                         "Favourite took pole": st.column_config.NumberColumn(format="percent"),
-                         "Pole log-loss ↓": st.column_config.NumberColumn(format="%.3f"),
-                         "Top-3 Brier ↓": st.column_config.NumberColumn(format="%.3f"),
-                         "Avg. position error ↓": st.column_config.NumberColumn(format="%.2f")})
-        st.markdown("Pole is hard to call: small gaps, track evolution and mistakes decide it. "
-                    "This weekend's pace (practice or Sprint Qualifying) clearly improves the "
-                    "prediction over recent form alone.")
+    _accuracy_panel(year, rnd, ("quali",))
 
 
-# ---------------------------------------------------------------- upgrades
-@st.cache_data(show_spinner=False, ttl=600)
 def _event_upgrades(year: int, event_name: str) -> pd.DataFrame | None:
     """Declared upgrades of one event, or None if the FIA document isn't downloaded yet."""
     done = upgrades.events_done()
@@ -999,15 +961,64 @@ def _temperatures(year: int, rnd: int) -> dict:
 @st.cache_resource(show_spinner=False, max_entries=4)
 def _calibration_data(year: int, rnd: int):
     _, hist, _ = _prepared(year, rnd)
-    qrows = _quali_data(year, rnd)
-    years = range(year - pdata.HISTORY_SEASONS + 1, year + 1)
-    sprints = pd.concat([pdata.season_sprints(y) for y in years], ignore_index=True)
-    text = "Learning from past predictions vs. results (first time ~1–2 min)…"
+    D = dict(hist=hist, qrows=_quali_data(year, rnd),
+             sprints=pdata.sprints_range(pdata.DATA_START, year))
+    text = "Re-predicting past events with only earlier data (first time ~1 min)…"
     bar = st.progress(0.0, text=text)
-    events = calibration.walk_forward_events(hist, qrows, sprints, (year, rnd),
+    events = calibration.walk_forward_events(D, (year, rnd),
                                              progress=lambda f: bar.progress(f, text=text))
     bar.empty()
     return calibration.temperatures(events), events
+
+
+GAP_PER_PLACE = 0.15  # % qualifying gap that corresponds to roughly one grid place
+
+
+def _apply_shift(X: pd.DataFrame, shift: np.ndarray, extra_rank=()) -> pd.DataFrame:
+    """Apply manual/wet adjustments (in places) to position- and gap-type features."""
+    X = X.copy()
+    for c in ("quali_form", "form", *extra_rank):
+        if c in X:
+            X[c] = X[c] - shift
+    for c in ("quali_gap", "race_pace", "fp_gap"):
+        if c in X:
+            X[c] = X[c] - shift * GAP_PER_PLACE
+    return X
+
+
+_KIND_LABEL = {"race": "Race (after qualifying)", "race_pre": "Race (before qualifying)",
+               "sprint": "Sprint", "quali": "Qualifying"}
+
+
+def _accuracy_panel(year: int, rnd: int, kinds: tuple) -> None:
+    """Walk-forward accuracy per season, from the shared backtest store."""
+    with st.expander("Model accuracy (walk-forward backtest)"):
+        _calibration_data(year, rnd)  # keeps the store up to date
+        events = [e for e in evaluate.load_store() if e["kind"] in kinds
+                  and (e["season"], e["round"]) < (year, rnd)]
+        if not events:
+            st.info("No re-predicted events yet.")
+            return
+        tab = evaluate.season_summary(events)
+        tab["kind"] = tab["kind"].map(_KIND_LABEL)
+        st.markdown("Every event since 2020 was predicted using only data from before it, with "
+                    "the confidence correction learned from earlier seasons, and compared with "
+                    "the real result. Event-by-event detail is on the **Track record** page.")
+        st.dataframe(
+            tab.rename(columns={"season": "Season", "kind": "Session", "events": "Events",
+                                "fav_hit": "Favourite won", "top3_hits": "Top 3 correct",
+                                "logloss": "Log loss ↓", "spearman": "Order correlation",
+                                "pos_mae": "Position error ↓"}),
+            hide_index=True, width="stretch",
+            column_config={"Season": st.column_config.NumberColumn(format="%d"),
+                           "Favourite won": st.column_config.NumberColumn(format="percent"),
+                           "Top 3 correct": st.column_config.NumberColumn(format="%.2f"),
+                           "Log loss ↓": st.column_config.NumberColumn(format="%.3f"),
+                           "Order correlation": st.column_config.NumberColumn(format="%.2f"),
+                           "Position error ↓": st.column_config.NumberColumn(format="%.2f")})
+        st.caption("*Order correlation* compares the predicted and actual finishing order "
+                   "(1 = identical). Bookmakers use similar information plus insider knowledge "
+                   "and a margin, so treat these numbers as a second opinion, not a betting signal.")
 
 
 def _calib_note(calib: dict, what: str) -> str:

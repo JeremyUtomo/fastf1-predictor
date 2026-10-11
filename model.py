@@ -15,8 +15,10 @@ without Streamlit.
 """
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -31,16 +33,24 @@ FEATURE_INFO = {
     "team_pace": "Team's recent qualifying positions, both cars (car performance)",
     "team_trend": "Team's qualifying trend over the last 5 races — captures upgrades",
     "circuit_aff": "Driver's results at this circuit vs. their usual level",
+    "quali_gap": "Recent qualifying pace: gap to the fastest time in % (recent weigh more)",
+    "team_gap": "Team's recent qualifying pace in % gap, both cars (car performance)",
+    "driver_edge": "Driver vs. own teammate in qualifying (% faster), long memory: driver skill",
+    "race_pace": "Recent race pace: fastest race lap vs. the fastest of the race, in %",
+    "grid_chaos": "Starting position × how much positions change at this circuit",
+    "qgap_now": "This weekend's qualifying gap to pole in % (how dominant the pole lap was)",
 }
 MID_FIELD = 11.0
-HALF_LIFE = 3.0  # races
+HALF_LIFE = 3.0          # races, for recent form
+DRIVER_HALF_LIFE = 10.0  # races: driver skill changes slowly, the car quickly
+GAP_DEFAULT = 1.5        # % gap assumed without history (roughly midfield)
 
 
-def _ew_mean(values: list[float], n: int, default: float) -> float:
+def _ew_mean(values: list[float], n: int, default: float, half_life: float = HALF_LIFE) -> float:
     if not values:
         return default
     v = np.asarray(values[-n:], dtype=float)
-    w = 0.5 ** (np.arange(len(v))[::-1] / HALF_LIFE)
+    w = 0.5 ** (np.arange(len(v))[::-1] / half_life)
     return float(np.sum(v * w) / np.sum(w))
 
 
@@ -60,6 +70,10 @@ class FeatureBuilder:
     circuit_shuffle: dict = field(default_factory=lambda: defaultdict(list))
     all_shuffle: list = field(default_factory=list)
     all_dnf: list = field(default_factory=list)
+    drv_qgap: dict = field(default_factory=lambda: defaultdict(list))
+    team_qgap: dict = field(default_factory=lambda: defaultdict(list))
+    drv_edge: dict = field(default_factory=lambda: defaultdict(list))
+    drv_rpace: dict = field(default_factory=lambda: defaultdict(list))
 
     def features(self, driver: str, team: str, circuit: str) -> dict:
         team_hist = self.team_quali[team]
@@ -73,8 +87,15 @@ class FeatureBuilder:
         form = _ew_mean(self.drv_finish[driver], 6, team_pace + 1)
         resid = self.circuit_resid[(driver, circuit)]
         circuit_aff = float(np.sum(resid) / (len(resid) + 2))  # shrunk towards 0
+        team_gap = _ew_mean(self.team_qgap[team], 6, GAP_DEFAULT)
+        edges = self.drv_edge[driver]
+        driver_edge = (_ew_mean(edges, 30, 0.0, DRIVER_HALF_LIFE) * len(edges[-30:])
+                       / (len(edges[-30:]) + 3))  # shrunk towards 0 for new drivers
         return dict(form=form, quali_form=quali_form, team_pace=team_pace,
                     team_trend=trend, circuit_aff=circuit_aff,
+                    quali_gap=_ew_mean(self.drv_qgap[driver], 6, team_gap),
+                    team_gap=team_gap, driver_edge=driver_edge,
+                    race_pace=_ew_mean(self.drv_rpace[driver], 6, team_gap),
                     n_circuit=len(resid), p_dnf=self.dnf_prob(driver, team))
 
     def dnf_prob(self, driver: str, team: str) -> float:
@@ -94,8 +115,11 @@ class FeatureBuilder:
     def update(self, race: pd.DataFrame, quali: pd.DataFrame, feats: pd.DataFrame) -> None:
         """Add one race (all entries) to the histories."""
         q = quali.set_index("driverId")["quali"] if len(quali) else pd.Series(dtype=float)
+        qgap = (quali.set_index("driverId")["qgap"] if len(quali) and "qgap" in quali
+                else pd.Series(dtype=float))
         circuit = race["circuitId"].iloc[0]
         team_q = defaultdict(list)
+        team_gaps = defaultdict(dict)
         for row in race.itertuples():
             ok = classified(row.positionText)
             started = row.positionText != "W"
@@ -105,6 +129,13 @@ class FeatureBuilder:
             if pd.notna(qpos):
                 self.drv_quali[row.driverId].append(float(qpos))
                 team_q[row.constructorId].append(float(qpos))
+            gap = qgap.get(row.driverId, np.nan)
+            if pd.notna(gap):
+                self.drv_qgap[row.driverId].append(float(gap))
+                team_gaps[row.constructorId][row.driverId] = float(gap)
+            rpace = getattr(row, "flap_gap", np.nan)
+            if pd.notna(rpace):
+                self.drv_rpace[row.driverId].append(float(rpace))
             if started:
                 self.drv_dnf[row.driverId].append(not ok)
                 self.team_dnf[row.constructorId].append(not ok)
@@ -120,6 +151,12 @@ class FeatureBuilder:
                     self.all_shuffle.append(shuffle)
         for team, vals in team_q.items():
             self.team_quali[team].append(float(np.mean(vals)))
+        for team, gaps in team_gaps.items():
+            self.team_qgap[team].append(float(np.mean(list(gaps.values()))))
+            if len(gaps) == 2:  # driver vs. teammate: same car, so the gap is the driver
+                (a, ga), (b, gb) = gaps.items()
+                self.drv_edge[a].append(gb - ga)
+                self.drv_edge[b].append(ga - gb)
 
 
 def build_history(races: pd.DataFrame, quali: pd.DataFrame,
@@ -136,15 +173,20 @@ def build_history(races: pd.DataFrame, quali: pd.DataFrame,
             break
         race = races[(races["season"] == season) & (races["round"] == rnd)]
         rq = quali[(quali["season"] == season) & (quali["round"] == rnd)]
+        qgap_now = (rq.set_index("driverId")["qgap"] if "qgap" in rq and len(rq)
+                    else pd.Series(dtype=float))
         circuit = race["circuitId"].iloc[0]
         feats = {}
         chaos = builder.chaos(circuit)
         for row in race.itertuples():
             f = builder.features(row.driverId, row.constructorId, circuit)
+            # this weekend's qualifying gap: known before the race, like the grid
+            f["qgap_now"] = float(qgap_now.get(row.driverId, np.nan))
             f.update(season=season, round=rnd, circuitId=circuit, driverId=row.driverId,
                      driverCode=row.driverCode, constructorId=row.constructorId,
                      grid=float(row.grid) if row.grid > 0 else 21.0,
                      grid_log=float(np.log(row.grid if row.grid > 0 else 21.0)),
+                     grid_chaos=float(np.log(row.grid if row.grid > 0 else 21.0)) * (chaos - 1),
                      finish=float(row.position), classified=classified(row.positionText),
                      started=row.positionText != "W", chaos=chaos)
             feats[row.driverId] = f
@@ -199,35 +241,63 @@ class RankFit:
 
 
 def fit_rank(hist: pd.DataFrame, features: list[str], top_k: int = 3, l2: float = 1.0,
-             min_races_seen: int = 3) -> RankFit:
+             min_races_seen: int = 3, half_life: float | None = None) -> RankFit:
+    """Maximum-likelihood Plackett-Luce fit on the top `top_k` places of every event.
+
+    `half_life` (in events) down-weights older events, as in time-weighted
+    Plackett-Luce models (Henderson & Kirrane 2018); None weighs all equally.
+    """
+    seen = hist.groupby(["season", "round"]).ngroup()
+    train = hist[hist["classified"] & (seen >= min_races_seen)].dropna(subset=features)
+    groups = [g[features].to_numpy(float) for _, g in
+              train.sort_values(["season", "round", "finish"]).groupby(["season", "round"], sort=True)]
+    return fit_arrays(groups, features, top_k=top_k, l2=l2, half_life=half_life)
+
+
+def fit_arrays(groups: list[np.ndarray], features: list[str], top_k: int = 3, l2: float = 1.0,
+               half_life: float | None = None, beta0: np.ndarray | None = None) -> RankFit:
+    """Core fit on per-event feature arrays (rows in finishing order, oldest event first)."""
     from scipy.optimize import minimize
 
-    seen = hist.groupby(["season", "round"]).ngroup()
-    train = hist[hist["classified"] & (seen >= min_races_seen)]
-    X_all = train[features].to_numpy(float)
+    X_all = np.vstack(groups)
     mean, std = X_all.mean(0), X_all.std(0) + 1e-9
-    races = []
-    for _, race in train.sort_values("finish").groupby(["season", "round"], sort=False):
-        races.append((race[features].to_numpy(float) - mean) / std)
+    R, F = len(groups), len(features)
+    N = max(len(g) for g in groups)
+    X = np.zeros((R, N, F))
+    n = np.array([len(g) for g in groups])
+    for i, g in enumerate(groups):
+        X[i, :len(g)] = (g - mean) / std
+    mask = np.arange(N)[None, :] < n[:, None]
+    age = R - 1 - np.arange(R)
+    w = 0.5 ** (age / half_life) if half_life else np.ones(R)
+    w = w * R / w.sum()  # mean weight 1, so l2 means the same for every half-life
 
     def nll(beta):
-        total, grad = 0.0, np.zeros_like(beta)
-        for X in races:
-            s = X @ beta
-            n = len(s)
-            for r in range(min(top_k, n - 1)):
-                tail = s[r:]
-                m = tail.max()
-                p = np.exp(tail - m)
-                z = p.sum()
-                total -= s[r] - (m + np.log(z))
-                grad -= X[r] - (p / z) @ X[r:]
+        s = np.where(mask, X @ beta, -np.inf)
+        total, grad = 0.0, np.zeros(F)
+        for r in range(top_k):
+            valid = r < n - 1
+            if not valid.any():
+                break
+            tail = s[:, r:]
+            m = np.max(tail, axis=1)
+            m = np.where(np.isfinite(m), m, 0.0)
+            e = np.exp(tail - m[:, None])
+            z = e.sum(1)
+            zs = np.where(z > 0, z, 1.0)
+            ll = np.where(valid, s[:, r] - (m + np.log(zs)), 0.0)
+            wv = w * valid
+            total -= float(wv @ ll)
+            p = np.where(valid[:, None], e / zs[:, None], 0.0)
+            exp_x = np.einsum("rn,rnf->rf", p, X[:, r:, :])
+            grad -= (wv[:, None] * (X[:, r, :] - exp_x)).sum(0)
         total += 0.5 * l2 * beta @ beta
         grad += l2 * beta
         return total, grad
 
-    res = minimize(nll, np.zeros(len(features)), jac=True, method="L-BFGS-B")
-    return RankFit(features, res.x, mean, std, len(races))
+    start = beta0 if beta0 is not None and len(beta0) == F else np.zeros(F)
+    res = minimize(nll, start, jac=True, method="L-BFGS-B")
+    return RankFit(list(features), res.x, mean, std, R)
 
 
 def simulate_rank(strength: np.ndarray, p_dnf: np.ndarray, randomness: float = 1.0,
@@ -242,37 +312,6 @@ def simulate_rank(strength: np.ndarray, p_dnf: np.ndarray, randomness: float = 1
     pos = np.empty_like(order)
     pos[np.arange(n)[:, None], order] = np.arange(1, d + 1)
     return np.where(dnf, 99, pos)
-
-
-def backtest(hist: pd.DataFrame, season: int, features: list[str] | None = None,
-                  n_sims: int = 4000, use_chaos: bool = True) -> pd.DataFrame:
-    """Walk-forward test of the ranking model vs. a grid-only ranking model."""
-    rows = []
-    races = hist[hist["season"] == season][["season", "round"]].drop_duplicates()
-    for _, rnd in races.itertuples(index=False):
-        past = hist[(hist["season"] < season) | ((hist["season"] == season) & (hist["round"] < rnd))]
-        race = hist[(hist["season"] == season) & (hist["round"] == rnd) & hist["started"]]
-        winner = race.loc[race["finish"] == 1, "driverId"]
-        if len(race) < 10 or winner.empty:
-            continue
-        w_idx = list(race["driverId"]).index(winner.iloc[0])
-        actual = race["finish"].to_numpy()
-        chaos = race["chaos"].to_numpy() if use_chaos else 1.0
-        for name, feats in (("model", features or FEATURES_POST), ("grid only", ["grid_log"])):
-            f = fit_rank(past, feats)
-            s = f.strength(race)
-            pos = simulate_rank(s / chaos, race["p_dnf"].to_numpy(), n=n_sims, seed=int(rnd))
-            p_win, p_pod = (pos == 1).mean(0), (pos <= 3).mean(0)
-            fin = race["classified"].to_numpy()
-            exp_pos = np.array([np.mean(pos[:, i][pos[:, i] < 99]) for i in range(len(race))])
-            rows.append(dict(
-                round=rnd, model=name,
-                winner_logloss=-np.log(max(p_win[w_idx], 1e-3)),
-                top_pick_won=bool(np.argmax(p_win) == w_idx),
-                podium_brier=float(np.mean((p_pod - (actual <= 3)) ** 2)),
-                pos_mae=float(np.mean(np.abs(exp_pos[fin] - actual[fin]))),
-            ))
-    return pd.DataFrame(rows)
 
 
 # --------------------------------------------- grid estimated before qualifying
@@ -296,9 +335,31 @@ def fit_grid_estimate(hist: pd.DataFrame, sprints: pd.DataFrame,
     return w, float(np.std(y - X @ w))
 
 
+def with_grid(X: pd.DataFrame, grid: np.ndarray, chaos: float,
+              qgap: np.ndarray | None = None, qgap_lookup=None) -> pd.DataFrame:
+    """Set the starting grid and the features derived from it."""
+    X = X.copy()
+    g = np.clip(np.asarray(grid, dtype=float), 1, 22)
+    X["grid"], X["grid_log"] = g, np.log(g)
+    X["grid_chaos"] = X["grid_log"] * (chaos - 1)
+    if qgap is None and qgap_lookup is not None:
+        qgap = qgap_lookup(g)
+    if qgap is not None:
+        X["qgap_now"] = qgap
+    return X
+
+
+def qgap_lookup(hist: pd.DataFrame):
+    """Typical qualifying gap (%) for a grid position, from history (for estimated grids)."""
+    med = hist.groupby(hist["grid"].round().clip(1, 22))["qgap_now"].median()
+    med = med.reindex(np.arange(1, 23)).interpolate().bfill().ffill()
+    return lambda g: np.interp(g, med.index.to_numpy(float), med.to_numpy(float))
+
+
 def simulate_uncertain_grid(fit: "RankFit", X: pd.DataFrame, est_grid: np.ndarray, sd: float,
                             p_dnf: np.ndarray, randomness: float = 1.0, draws: int = 20,
-                            n_per_draw: int = 1000, seed: int = 7) -> np.ndarray:
+                            n_per_draw: int = 1000, seed: int = 7, chaos: float = 1.0,
+                            lookup=None) -> np.ndarray:
     """Simulate with a grid that is only estimated: each draw samples a plausible
     qualifying order (estimate + noise), then simulates races from that grid."""
     rng = np.random.default_rng(seed)
@@ -306,8 +367,7 @@ def simulate_uncertain_grid(fit: "RankFit", X: pd.DataFrame, est_grid: np.ndarra
     for k in range(draws):
         noisy = est_grid + rng.normal(0, sd, len(est_grid))
         grid = noisy.argsort().argsort() + 1.0  # rank -> positions 1..n
-        Xk = X.copy()
-        Xk["grid"], Xk["grid_log"] = grid, np.log(grid)
+        Xk = with_grid(X, grid, chaos, qgap_lookup=lookup)
         out.append(simulate_rank(fit.strength(Xk), p_dnf, randomness, n=n_per_draw,
                                  seed=seed + k))
     return np.vstack(out)
@@ -319,6 +379,7 @@ QUALI_VARIANTS = {"form": QUALI_BASE, "practice": QUALI_BASE + ["fp"],
                   "sprint quali": QUALI_BASE + ["sq"]}
 FEATURE_INFO.update({
     "fp": "Rank of the driver's best lap in the last practice session this weekend",
+    "fp_gap": "Gap (%) of the driver's best lap to the fastest in the last practice session",
     "sq": "Sprint Qualifying position this weekend",
 })
 
@@ -335,8 +396,17 @@ def quali_rows(hist: pd.DataFrame, quali: pd.DataFrame, sprints: pd.DataFrame,
     sq = sprints.assign(sq=sprints["sq"].where(sprints["sq"] > 0, 21))
     q = q.merge(sq[["season", "round", "driverId", "sq"]], on=["season", "round", "driverId"],
                 how="left")
-    q["fp"] = [fp[(s, r)].get(d, np.nan) if (s, r) in fp else np.nan
-               for s, r, d in zip(q["season"], q["round"], q["driverId"])]
+    def pace(s, r, d, col):
+        p = fp.get((s, r))
+        if p is None:
+            return np.nan
+        if isinstance(p, pd.Series):  # rank only
+            return p.get(d, np.nan) if col == "rank" else np.nan
+        return p[col].get(d, np.nan) if col in p else np.nan
+
+    keys = list(zip(q["season"], q["round"], q["driverId"]))
+    q["fp"] = [pace(s, r, d, "rank") for s, r, d in keys]
+    q["fp_gap"] = [pace(s, r, d, "gap") for s, r, d in keys]
     q["finish"], q["classified"] = q["quali"].astype(float), True
     return q
 
@@ -358,33 +428,6 @@ def fill_missing(X: pd.DataFrame, features: list[str]) -> pd.DataFrame:
     return X
 
 
-def quali_backtest(rows: pd.DataFrame, season: int, n_sims: int = 5000) -> pd.DataFrame:
-    """Walk-forward test: weekend-data model vs. form only, per weekend type."""
-    out = []
-    for rnd in sorted(rows[rows["season"] == season]["round"].unique()):
-        past = rows[(rows["season"] < season) | ((rows["season"] == season) & (rows["round"] < rnd))]
-        wk = rows[(rows["season"] == season) & (rows["round"] == rnd)]
-        if len(wk) < 15:
-            continue
-        variant = weekend_variant(wk)
-        pole = int(np.argmin(wk["finish"].to_numpy()))
-        for name in dict.fromkeys(["form", variant]):
-            feats = QUALI_VARIANTS[name]
-            train = past.dropna(subset=feats)
-            if train.groupby(["season", "round"]).ngroups < 5:
-                continue
-            f = fit_rank(train, feats)
-            pos = simulate_rank(f.strength(fill_missing(wk, feats)), np.zeros(len(wk)),
-                                n=n_sims, seed=int(rnd))
-            actual = wk["finish"].to_numpy()
-            out.append(dict(round=rnd, weekend=variant, model=name,
-                            pole_logloss=-np.log(max((pos == 1).mean(0)[pole], 1e-3)),
-                            fav_on_pole=bool(np.argmax((pos == 1).mean(0)) == pole),
-                            top3_brier=float(np.mean(((pos <= 3).mean(0) - (actual <= 3)) ** 2)),
-                            pos_mae=float(np.mean(np.abs(pos.mean(0) - actual)))))
-    return pd.DataFrame(out)
-
-
 # ---------------------------------------------------------------- upgrades
 FEATURE_INFO.update({
     "upg_perf": "Performance upgrades the team declared to the FIA for this event",
@@ -404,3 +447,54 @@ def add_upgrades(rows: pd.DataFrame, counts: pd.DataFrame) -> pd.DataFrame:
     out = rows.drop(columns=[x for x in ("upg_perf", "upg_perf_prev") if x in rows], errors="ignore")
     return out.merge(c[["season", "round", "constructorId", "upg_perf", "upg_perf_prev"]],
                      on=["season", "round", "constructorId"], how="left")
+
+
+# ------------------------------------------------------------ model config
+# Feature sets and settings per model family. `model_config.json` (written by
+# `python evaluate.py --tune`) overrides these defaults, so re-tuning the model
+# needs no code change.
+CONFIG_FILE = Path(__file__).with_name("model_config.json")
+DEFAULT_CONFIG = {
+    "race_post": dict(features=list(FEATURES_POST), top_k=3, l2=1.0, half_life=None,
+                      train_seasons=4),
+    "race_pre": dict(features=list(FEATURES_PRE), top_k=3, l2=1.0, half_life=None,
+                     train_seasons=4),
+    "quali": dict(base=list(QUALI_BASE), practice="fp", top_k=3, l2=1.0, half_life=None,
+                  train_seasons=4),
+}
+
+
+def load_config() -> dict:
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    try:
+        saved = json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return cfg
+    for family in cfg:
+        cfg[family].update(saved.get(family, {}))
+    cfg["_meta"] = saved.get("_meta", {})
+    return cfg
+
+
+CONFIG = load_config()
+
+
+def quali_features(variant: str, cfg: dict | None = None) -> list[str]:
+    q = (cfg or CONFIG)["quali"]
+    extra = {"form": [], "practice": [q["practice"]], "sprint quali": ["sq"]}[variant]
+    return list(q["base"]) + extra
+
+
+def training_rows(rows: pd.DataFrame, season: int, rnd: int, seasons: int) -> pd.DataFrame:
+    """Rows before (season, rnd), within the last `seasons` seasons."""
+    before = (rows["season"] < season) | ((rows["season"] == season) & (rows["round"] < rnd))
+    return rows[before & (rows["season"] >= season - seasons + 1)]
+
+
+def fit_family(rows: pd.DataFrame, family: str, season: int, rnd: int,
+               features: list[str] | None = None, cfg: dict | None = None) -> RankFit:
+    """Fit a model family on everything before (season, rnd) with its configured settings."""
+    c = (cfg or CONFIG)[family]
+    feats = features or c["features"]
+    train = training_rows(rows, season, rnd, c["train_seasons"]).dropna(subset=feats)
+    return fit_rank(train, feats, top_k=c["top_k"], l2=c["l2"], half_life=c["half_life"])

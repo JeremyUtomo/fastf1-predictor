@@ -40,7 +40,7 @@ results and practice data.
 | --- | --- |
 | Season | Calendar and driver / constructor standings |
 | Predictions | Qualifying, sprint and race probabilities, results vs. prediction, comparison with bookmaker odds |
-| Track record | Saved predictions scored against results, and what the model learned (calibration) |
+| Track record | Saved predictions scored against results, a backtest of every event since 2020, and what the model learned (calibration) |
 | Session analysis | Pick a session in the sidebar: Overview, Laps, Strategy, Telemetry, Weather, Race control and Data tabs |
 
 ## Predictions
@@ -54,6 +54,11 @@ and teammate battles. Each probability comes with *fair odds* (1 ÷ probability)
   grid is estimated from recent form plus this weekend's pace: Practice 3 on
   normal weekends, Sprint Qualifying on sprint weekends.
 - Recent finishing and qualifying positions, weighted towards recent races.
+- **Qualifying time gaps** (in % to the fastest time), not only positions: P2 by
+  0.03 s and P2 by 0.8 s are very different.
+- **Driver vs. teammate**: how much faster a driver is than their teammate in the
+  same car, with a long memory, to separate driver skill from car performance.
+- **Race pace**: each driver's fastest race lap relative to the fastest of the race.
 - Team qualifying pace and its trend over the last five races.
 - The driver's record at the circuit, how much positions usually change there,
   and driver/team retirement rates.
@@ -71,15 +76,43 @@ driver's chances changed.
 them, where the favourite finished, top-3 hits, average position error) and a
 predicted-vs-actual chart.
 
-**Method**: a Plackett-Luce ranking model fitted on the finishing order of the
-last four seasons, using only information available before each event, then
-20,000 simulated sessions. Sprint and rain effects are rules of thumb, not fitted.
+**Method**: a Plackett-Luce ranking model fitted on the finishing order of
+recent seasons, using only information available before each event, then
+20,000 simulated sessions. Which inputs and settings are used is decided by a
+walk-forward research run (below) and stored in `model_config.json`. Sprint and
+rain effects are rules of thumb; overall confidence is learned from results.
 
-**Accuracy**: every session view includes a walk-forward backtest. After
-qualifying the model is about as good as trusting the grid for winner and
-podium markets and clearly better for the rest of the order. Before
-qualifying it is less accurate. Bookmaker odds include a margin, so don't
-expect these numbers to beat them reliably.
+**Accuracy**: every session view and the **Track record** page show a
+walk-forward backtest of every event since 2020: what the model would have
+predicted at the time vs. what happened. Bookmaker odds include a margin, so
+don't expect these numbers to beat them reliably.
+
+### Research and tuning
+
+`python evaluate.py --tune` re-predicts every race, sprint and qualifying
+session from 2020 on (each with a model fitted only on earlier events), tests
+candidate improvements one by one on 2020–2025, keeps those that clearly help,
+checks the result once on 2026, and writes `model_config.json` plus
+[`research_report.md`](research_report.md). Re-run it to re-tune the model; the
+app picks the new settings up without code changes.
+
+What the latest run found (winner/pole log loss, lower is better, 2020–2025):
+
+| Model | Before | After |
+| --- | --- | --- |
+| Race, after qualifying | 1.252 | 1.192 |
+| Race, before qualifying | 1.608 | 1.498 |
+| Qualifying | 1.554 | 1.521 |
+| Sprint | 1.208 | 1.120 |
+
+- Adopted: qualifying **time gaps**, **driver vs. teammate** (both suggested by
+  research separating driver skill from constructor strength, e.g. van Kesteren &
+  Bergkamp 2023) and **race pace**; qualifying also trains on six seasons.
+- Not adopted: time-weighting older races (helpful in Henderson & Kirrane 2018,
+  but our form features already emphasise recent races), longer training windows
+  for races, a grid × circuit interaction, and this weekend's pole gap.
+- The 2026 check (16 events, new rules) shows small differences in both
+  directions that are within noise; details per season are in the report.
 
 ### Learning from results
 
@@ -132,6 +165,10 @@ and compared with the model, including the bookmaker's margin.
 - [Open-Meteo](https://open-meteo.com/) for weather forecasts
   ([CC BY 4.0](https://creativecommons.org/licenses/by/4.0/)).
 - [FIA](https://www.fia.com/documents) car presentation documents for declared upgrades.
+- Research: Henderson & Kirrane (2018), [time-weighted Plackett–Luce models for
+  F1](https://projecteuclid.org/journals/bayesian-analysis/volume-13/issue-2/A-Comparison-of-Truncated-and-Time-Weighted-PlackettLuce-Models-for/10.1214/17-BA1048.full);
+  van Kesteren & Bergkamp (2023), [driver skill vs. constructor
+  advantage](https://arxiv.org/abs/2203.08489v2).
 
 ## License
 
