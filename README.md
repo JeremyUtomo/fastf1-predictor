@@ -13,7 +13,7 @@ weather and race control messages.
 Python 3.10 or newer (3.13 is tested).
 
 ```bash
-git clone https://github.com/jeremyutomo/fastf1-predictor.git
+git clone https://github.com/JeremyUtomo/fastf1-predictor.git
 cd fastf1-predictor
 python3 -m venv .venv
 source .venv/bin/activate
