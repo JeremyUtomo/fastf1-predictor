@@ -42,6 +42,15 @@ def _sessions(event: pd.Series) -> dict[str, pd.Timestamp]:
     return out
 
 
+def _next_round(year: int, now: pd.Timestamp) -> int | None:
+    """The next weekend: the first round whose race hasn't finished (start + 3 h).
+    Only its predictions are saved, so browsing later weekends doesn't log them."""
+    schedule = data.get_schedule(year)
+    later = schedule[(schedule["RoundNumber"] > 0)
+                     & (schedule["Session5DateUtc"] > now - pd.Timedelta(hours=3))]
+    return int(later["RoundNumber"].iloc[0]) if len(later) else None
+
+
 def _quali_name(sessions: dict, target: str) -> str | None:
     if target == "Race":
         return "Qualifying" if "Qualifying" in sessions else None
@@ -248,11 +257,11 @@ def render() -> None:
         year = st.selectbox("Season", seasons, key="pred_season")
     schedule = data.get_schedule(year)
     schedule = schedule[schedule["RoundNumber"] > 0]
-    now = data.now_utc()
-    upcoming = [i for i, d in enumerate(schedule["Session5DateUtc"]) if pd.notna(d) and d > now - pd.Timedelta(hours=3)]
+    next_rnd = _next_round(year, data.now_utc())
     rounds = list(schedule["RoundNumber"].astype(int))
     with c1:
-        rnd = st.selectbox("Grand Prix", rounds, index=upcoming[0] if upcoming else len(rounds) - 1,
+        rnd = st.selectbox("Grand Prix", rounds,
+                           index=rounds.index(next_rnd) if next_rnd in rounds else len(rounds) - 1,
                            format_func=lambda r: f"R{r} · {schedule.set_index('RoundNumber').loc[r, 'EventName']}",
                            key=f"pred_round_{year}")
     event = schedule[schedule["RoundNumber"] == rnd].iloc[0]
@@ -457,7 +466,7 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
     result["Fair odds (win)"] = (1 / result["Win"]).where(result["Win"] > 0.001)
     result = result.sort_values("Win", ascending=False).reset_index(drop=True)
 
-    if start is not None and start > now:
+    if start is not None and start > now and rnd == _next_round(year, now):
         calibration.log_prediction(year, rnd, event["EventName"], target, mode, result,
                                    "Win", "Podium")
     actual = _results(sessions, target, year, rnd, races)
@@ -902,7 +911,7 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
                            "Q2 (top 15)": (pos <= 15).mean(0), "Expected pos.": pos.mean(0)})
     result["Fair odds (pole)"] = (1 / result["Pole"]).where(result["Pole"] > 0.001)
     result = result.sort_values("Pole", ascending=False).reset_index(drop=True)
-    if start > now:
+    if start > now and rnd == _next_round(year, now):
         calibration.log_prediction(year, rnd, event["EventName"], "Qualifying",
                                    f"form + {source}" if variant != "form" else "form only",
                                    result, "Pole", "Top 3")
