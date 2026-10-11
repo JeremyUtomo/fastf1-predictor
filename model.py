@@ -44,6 +44,9 @@ MID_FIELD = 11.0
 HALF_LIFE = 3.0          # races, for recent form
 DRIVER_HALF_LIFE = 10.0  # races: driver skill changes slowly, the car quickly
 GAP_DEFAULT = 1.5        # % gap assumed without history (roughly midfield)
+# retirement model (walk-forward tested): long windows, strong shrinkage, and
+# teammates' retirements are linked (team-wide failures, collisions)
+DNF = dict(prior=30, driver_window=30, team_window=40, driver_weight=0.2, teammate_rho=0.2)
 
 
 def _ew_mean(values: list[float], n: int, default: float, half_life: float = HALF_LIFE) -> float:
@@ -99,11 +102,15 @@ class FeatureBuilder:
                     n_circuit=len(resid), p_dnf=self.dnf_prob(driver, team))
 
     def dnf_prob(self, driver: str, team: str) -> float:
+        """Retirement chance: mostly the team's long-run rate, strongly shrunk towards the
+        field average (retirements are largely random; tested walk-forward 2021–2026,
+        this beat shorter, less shrunk estimates)."""
+        c = DNF
         base = np.mean(self.all_dnf[-400:]) if self.all_dnf else 0.1
-        d, t = self.drv_dnf[driver][-12:], self.team_dnf[team][-24:]
-        p_d = (np.sum(d) + 3 * base) / (len(d) + 3)
-        p_t = (np.sum(t) + 3 * base) / (len(t) + 3)
-        return float(0.5 * p_d + 0.5 * p_t)
+        d, t = self.drv_dnf[driver][-c["driver_window"]:], self.team_dnf[team][-c["team_window"]:]
+        p_d = (np.sum(d) + c["prior"] * base) / (len(d) + c["prior"])
+        p_t = (np.sum(t) + c["prior"] * base) / (len(t) + c["prior"])
+        return float(c["driver_weight"] * p_d + (1 - c["driver_weight"]) * p_t)
 
     def chaos(self, circuit: str) -> float:
         """How much positions change at this circuit relative to average (0.75–1.35)."""
@@ -301,12 +308,25 @@ def fit_arrays(groups: list[np.ndarray], features: list[str], top_k: int = 3, l2
 
 
 def simulate_rank(strength: np.ndarray, p_dnf: np.ndarray, randomness: float = 1.0,
-                  n: int = 20000, seed: int = 7) -> np.ndarray:
-    """Plackett-Luce samples via the Gumbel trick. `randomness` > 1 = more chaos."""
+                  n: int = 20000, seed: int = 7, teams=None) -> np.ndarray:
+    """Plackett-Luce samples via the Gumbel trick. `randomness` > 1 = more chaos.
+
+    With `teams`, teammates' retirements are correlated (Gaussian copula,
+    DNF['teammate_rho']): both cars retiring is more likely than independent chance.
+    """
+    from scipy.stats import norm
+
     rng = np.random.default_rng(seed)
     d = len(strength)
     util = strength[None, :] / randomness + rng.gumbel(size=(n, d))
-    dnf = rng.random((n, d)) < p_dnf[None, :]
+    if teams is not None and DNF["teammate_rho"] > 0:
+        codes = pd.factorize(pd.Series(list(teams)))[0]
+        shared = rng.standard_normal((n, codes.max() + 1))[:, codes]
+        rho = DNF["teammate_rho"]
+        z = np.sqrt(rho) * shared + np.sqrt(1 - rho) * rng.standard_normal((n, d))
+        dnf = norm.cdf(z) < p_dnf[None, :]
+    else:
+        dnf = rng.random((n, d)) < p_dnf[None, :]
     util = np.where(dnf, -1e6 + util, util)
     order = np.argsort(-util, axis=1)
     pos = np.empty_like(order)
@@ -359,7 +379,7 @@ def qgap_lookup(hist: pd.DataFrame):
 def simulate_uncertain_grid(fit: "RankFit", X: pd.DataFrame, est_grid: np.ndarray, sd: float,
                             p_dnf: np.ndarray, randomness: float = 1.0, draws: int = 20,
                             n_per_draw: int = 1000, seed: int = 7, chaos: float = 1.0,
-                            lookup=None) -> np.ndarray:
+                            lookup=None, teams=None) -> np.ndarray:
     """Simulate with a grid that is only estimated: each draw samples a plausible
     qualifying order (estimate + noise), then simulates races from that grid."""
     rng = np.random.default_rng(seed)
@@ -369,7 +389,7 @@ def simulate_uncertain_grid(fit: "RankFit", X: pd.DataFrame, est_grid: np.ndarra
         grid = noisy.argsort().argsort() + 1.0  # rank -> positions 1..n
         Xk = with_grid(X, grid, chaos, qgap_lookup=lookup)
         out.append(simulate_rank(fit.strength(Xk), p_dnf, randomness, n=n_per_draw,
-                                 seed=seed + k))
+                                 seed=seed + k, teams=teams))
     return np.vstack(out)
 
 

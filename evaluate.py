@@ -181,7 +181,8 @@ def predict_event(fitter: Fitter, kind: str, season: int, rnd: int, cfg: dict,
 
 def probabilities(ev: dict, temperature: float, seed: int = 11) -> dict:
     pos = model.simulate_rank(ev["strength"], ev["p_dnf"], randomness=temperature, n=N_SIMS,
-                              seed=seed + ev["round"])
+                              seed=seed + ev["round"],
+                              teams=None if ev["kind"] == "quali" else ev["teams"])
     finished = np.where(pos == 99, np.nan, pos)
     with np.errstate(all="ignore"):
         exp_pos = np.nanmean(finished, 0)
@@ -337,6 +338,7 @@ def holdout_report(D: dict, cfg: dict, log=print) -> pd.DataFrame:
 # --------------------------------------------------------------------- store
 def config_hash(cfg: dict) -> str:
     core = {k: cfg[k] for k in ("race_post", "race_pre", "quali")}
+    core["dnf"] = model.DNF  # stored predictions include retirement chances
     return hashlib.sha1(json.dumps(core, sort_keys=True).encode()).hexdigest()[:10]
 
 

@@ -399,6 +399,7 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
     if target == "Sprint":
         p_dnf = p_dnf * SPRINT_DNF
     drivers = list(entries["Driver"][keep])
+    teams_kept = entries["constructorId"][keep].to_numpy()
 
     qgaps = _quali_gaps(sessions, target, year, rnd) if grid is not None else None
 
@@ -412,7 +413,8 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
             X = model.with_grid(X, g, chaos, qgap=qg, qgap_lookup=lookup)
             if qg is not None:  # drivers without a time: typical gap for their grid slot
                 X["qgap_now"] = np.where(np.isnan(qg), lookup(X["grid"].to_numpy()), qg)
-            return fit_post, X, model.simulate_rank(fit_post.strength(X)[keep], p_dnf, randomness)
+            return fit_post, X, model.simulate_rank(fit_post.strength(X)[keep], p_dnf, randomness,
+                                                    teams=teams_kept)
         if how == "estimate":
             # Sprint Qualifying + recent form -> expected qualifying position; its
             # uncertainty is simulated (see model.simulate_uncertain_grid)
@@ -422,12 +424,13 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
             X = model.with_grid(X, est, chaos, qgap_lookup=lookup)
             return fit_post, X, model.simulate_uncertain_grid(
                 fit_post, X[keep], est[keep], est_sd, p_dnf, randomness, chaos=chaos,
-                lookup=lookup)
+                lookup=lookup, teams=teams_kept)
         if fp_rank is not None:
             fp = entries["Driver"].map(fp_rank).fillna(X["quali_form"]).to_numpy()
             X["quali_form"] = (1 - FP_BLEND) * X["quali_form"] + FP_BLEND * fp
         X = _apply_shift(X, shift)
-        return fit_pre, X, model.simulate_rank(fit_pre.strength(X)[keep], p_dnf, randomness)
+        return fit_pre, X, model.simulate_rank(fit_pre.strength(X)[keep], p_dnf, randomness,
+                                               teams=teams_kept)
 
     pre_how = "estimate" if sq is not None else "pre"
     how = "grid" if edited["Grid"].notna().all() else pre_how
@@ -511,13 +514,15 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
                      column_config={**_pct(teams, ["Win"]),
                                     "Fair odds": st.column_config.NumberColumn(format="%.1f")})
 
-    _head_to_head(pos, drivers, entries[keep].reset_index(drop=True), key=target)
+    _head_to_head(pos, drivers, entries[keep].reset_index(drop=True), key=target,
+                  record=_season_record(races, year, rnd) if target == "Race" else None)
     _value_check(result, MARKETS, key=target, entries=entries, evidence=evidence)
     _explain(fit, X[keep], feats[keep], entries[keep], wet_gain, rain, chaos, target, year, rnd,
              sq)
 
 
-def _head_to_head(pos: np.ndarray, drivers: list[str], entries: pd.DataFrame, key: str) -> None:
+def _head_to_head(pos: np.ndarray, drivers: list[str], entries: pd.DataFrame, key: str,
+                  record: dict | None = None) -> None:
     st.markdown("##### Head-to-head")
     a_col, b_col, res_col = st.columns([1, 1, 3])
     with a_col:
@@ -532,18 +537,54 @@ def _head_to_head(pos: np.ndarray, drivers: list[str], entries: pd.DataFrame, ke
                         f"Both retire: {both:.0%}. A driver who retires counts as behind one who "
                         "finishes; check your bookmaker's rules for this case.")
     rows = []
+    race = (pos == 99).any() or record is not None
     for team, g in entries.groupby("Team"):
         if len(g) != 2:
             continue
         i, j = g.index
         pi, pj, _ = model.head_to_head(pos, i, j)
-        rows.append({"Team": team, "Driver 1": drivers[i], "P(1 ahead)": pi,
-                     "Driver 2": drivers[j], "P(2 ahead)": pj})
+        row = {"Team": team, "Driver 1": drivers[i], "P(1 ahead)": pi,
+               "Driver 2": drivers[j], "P(2 ahead)": pj}
+        if race:
+            fin = (pos[:, i] != 99) & (pos[:, j] != 99)
+            row.update({"Both finish": fin.mean(),
+                        "Both in points": ((pos[:, i] <= 10) & (pos[:, j] <= 10)).mean(),
+                        "Both retire": ((pos[:, i] == 99) & (pos[:, j] == 99)).mean()})
+            row["Fair odds (both finish)"] = 1 / max(row["Both finish"], 1e-3)
+            cid = g["constructorId"].iloc[0] if "constructorId" in g else None
+            if record is not None and cid in record:
+                r = record[cid]
+                row["This season"] = (f"both finished {r['both_finish']} of {r['n']}, "
+                                      f"both retired {r['both_dnf']}")
+        rows.append(row)
     if rows:
-        with st.expander("Teammate battles"):
+        with st.expander("Teammate battles", expanded=False):
             tm = pd.DataFrame(rows)
-            st.dataframe(_as_pct(tm, ["P(1 ahead)", "P(2 ahead)"]), hide_index=True,
-                         width="stretch", column_config=_pct(tm, ["P(1 ahead)", "P(2 ahead)"]))
+            pcts = ["P(1 ahead)", "P(2 ahead)", "Both finish", "Both in points", "Both retire"]
+            st.dataframe(_as_pct(tm, pcts), hide_index=True, width="stretch",
+                         height=ui.table_height(len(tm)), row_height=ui.ROW_HEIGHT,
+                         column_config={**_pct(tm, pcts), "Fair odds (both finish)":
+                                        st.column_config.NumberColumn(format="%.2f")})
+            if race:
+                st.caption("*Both finish* = both cars classified (completing 90% of the race). "
+                           "Teammates' retirements are modelled as linked, because team-wide "
+                           "problems and collisions make a double retirement more likely than "
+                           "chance. The model's retirement rates are long-run averages, so a team "
+                           "in a reliability crisis can be worse than the model says: compare "
+                           "with *This season*.")
+
+
+def _season_record(races: pd.DataFrame, year: int, rnd: int) -> dict:
+    """Per team, this season before `rnd`: races where both cars finished / both retired."""
+    r = races[(races["season"] == year) & (races["round"] < rnd)]
+    r = r.assign(dnf=~r["positionText"].astype(str).str.isdigit())
+    out = {}
+    for cid, g in r.groupby("constructorId"):
+        per = g.groupby("round")["dnf"].agg(["sum", "size"])
+        per = per[per["size"] == 2]
+        out[cid] = dict(n=len(per), both_finish=int((per["sum"] == 0).sum()),
+                        both_dnf=int((per["sum"] == 2).sum()))
+    return out
 
 
 _ODDS = re.compile(r"(?<![\d.,])(\d{1,4}[.,]\d{1,2})(?![\d.,])")

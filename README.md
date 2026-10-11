@@ -172,6 +172,15 @@ Win probabilities for races and sprints are recalibrated with a correction learn
 from the backtest (it fixes favourites and pulls long shots down); pole and podium
 probabilities were already well calibrated.
 
+### Teammate markets and retirements
+
+The *Teammate battles* table shows who finishes ahead, plus **Both finish**
+(both classified), **Both in points** and **Both retire** with fair odds, next to
+the team's record this season. Retirement chances are long-run team rates,
+strongly shrunk towards the field average, with teammates' retirements linked
+(tested walk-forward 2020–2026: double retirements predicted 2.5% vs. 2.5%
+actual). They lag a team in a reliability crisis, so compare with *This season*.
+
 ### Starting grid
 
 After qualifying, the race and sprint use the **official FIA starting grid**
