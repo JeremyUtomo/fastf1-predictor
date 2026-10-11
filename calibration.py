@@ -129,3 +129,86 @@ def read_log() -> pd.DataFrame:
         return pd.read_csv(LOG_FILE)
     except (OSError, pd.errors.EmptyDataError):
         return pd.DataFrame(columns=LOG_COLUMNS)
+
+
+# ------------------------------------------------- long shots and favourites
+# Even after the temperature correction, the backtest shows the classic
+# favourite-longshot bias in win probabilities: drivers given 1–5% won less often,
+# favourites slightly more often. A logistic recalibration learned from the
+# backtest fixes most of it (tested walk-forward on 2021–2026). Pole and podium
+# probabilities were already well calibrated, so they are left alone.
+def _logit(p):
+    p = np.clip(np.asarray(p, dtype=float), 1e-5, 1 - 1e-5)
+    return np.log(p / (1 - p))
+
+
+def fit_win_recalibration(events: list[dict], kinds=("race", "sprint")) -> tuple[float, float]:
+    """(a, b) so that P(win) ≈ sigmoid(a + b·logit(p)), fitted on re-predicted events."""
+    from scipy.optimize import minimize
+
+    z, y = [], []
+    for e in events:
+        if e["kind"] in kinds:
+            z.extend(_logit(e.get("cal_p_first", e["p_first"])))
+            y.extend((np.asarray(e["finish"]) == 1).astype(float))
+    if sum(y) < 30:
+        return 0.0, 1.0
+    z, y = np.asarray(z), np.asarray(y)
+
+    def nll(w):
+        q = np.clip(1 / (1 + np.exp(-(w[0] + w[1] * z))), 1e-9, 1 - 1e-9)
+        return -float(np.sum(y * np.log(q) + (1 - y) * np.log(1 - q)))
+
+    a, b = minimize(nll, [0.0, 1.0], method="Nelder-Mead").x
+    return float(a), float(b)
+
+
+def recalibrate_win(p, w: tuple[float, float]) -> np.ndarray:
+    """Apply the win recalibration and renormalise so the field sums to 1."""
+    q = 1 / (1 + np.exp(-(w[0] + w[1] * _logit(p))))
+    return q / q.sum()
+
+
+BANDS = [0, .01, .02, .05, .10, .20, .40, 1.01]
+
+
+def _wilson(k: float, n: int, z: float = 1.645) -> tuple[float, float]:
+    """90% interval for a hit rate k/n (works for very few hits)."""
+    if n == 0:
+        return 0.0, 1.0
+    p = k / n
+    centre = (p + z * z / (2 * n)) / (1 + z * z / n)
+    half = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / (1 + z * z / n)
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def band_evidence(events: list[dict], kinds, market: str,
+                  win_recal: tuple[float, float] | None = None) -> pd.DataFrame:
+    """How often predictions in each probability band actually came true in the backtest.
+
+    market: 'first' (win / pole) or 'top3' (podium / top 3).
+    """
+    rows = []
+    for e in events:
+        if e["kind"] not in kinds:
+            continue
+        finish, cls = np.asarray(e["finish"]), np.asarray(e["classified"])
+        if market == "first":
+            p = np.asarray(e.get("cal_p_first", e["p_first"]))
+            if win_recal is not None:
+                p = recalibrate_win(p, win_recal)
+            y = finish == 1
+        else:
+            p = np.asarray(e.get("cal_p_top3", e["p_top3"]))
+            y = (finish <= 3) & cls
+        rows += [(pi, float(yi)) for pi, yi in zip(p, y)]
+    d = pd.DataFrame(rows, columns=["p", "y"])
+    if d.empty:
+        return d
+    d["band"] = pd.cut(d["p"], BANDS, right=False)
+    out = d.groupby("band", observed=True).agg(predicted=("p", "mean"), n=("y", "size"),
+                                               hits=("y", "sum")).reset_index()
+    out[["lo", "hi"]] = [_wilson(k, n) for k, n in zip(out["hits"], out["n"])]
+    out["left"] = [b.left for b in out["band"]]
+    out["right"] = [b.right for b in out["band"]]
+    return out

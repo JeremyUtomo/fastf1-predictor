@@ -50,7 +50,8 @@ top 6, points and retirement for sprints and races; winning team, head-to-heads
 and teammate battles. Each probability comes with *fair odds* (1 ÷ probability).
 
 **Inputs**
-- Starting grid from qualifying (editable for penalties). Before qualifying the
+- Starting grid from the official FIA starting grid (penalties, pit-lane starts),
+  or the qualifying result until that's published; editable. Before qualifying the
   grid is estimated from recent form plus this weekend's pace: Practice 3 on
   normal weekends, Sprint Qualifying on sprint weekends.
 - Recent finishing and qualifying positions, weighted towards recent races.
@@ -155,6 +156,28 @@ python upgrades.py 2024 2026
 Odds are not scraped. Copy a market from your bookmaker's page and paste it
 under *Paste odds*: driver names and decimal odds (2.50 or 2,50) are recognised
 and compared with the model, including the bookmaker's margin.
+
+A high "edge" on a long shot is usually model error, not value: in the backtest,
+drivers the raw model gave 1–5% won 2–4 times less often than that (the
+favourite–longshot bias), and a fair 1-in-50 bet still loses 49 times out of 50.
+So each bet shows:
+
+- **Hits ~1 in** — how rarely it comes in;
+- **Edge** — expected return per €1 if the model's probability is right;
+- **Cautious edge** — the same using the low end of how often predictions in that
+  probability range actually came true in the backtest;
+- **Verdict** — *Value* only when even the cautious edge is positive.
+
+Win probabilities for races and sprints are recalibrated with a correction learned
+from the backtest (it fixes favourites and pulls long shots down); pole and podium
+probabilities were already well calibrated.
+
+### Starting grid
+
+After qualifying, the race and sprint use the **official FIA starting grid**
+(provisional, then final), so grid penalties and pit-lane starts are included.
+Until it's published the qualifying result is used; the grid can always be
+edited under *Adjustments*.
 
 ## Data sources and credits
 

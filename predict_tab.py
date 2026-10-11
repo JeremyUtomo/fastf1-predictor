@@ -13,6 +13,7 @@ import calibration
 import charts
 import data
 import evaluate
+import grid_docs
 import model
 import predict_data as pdata
 import ui
@@ -226,15 +227,18 @@ def render() -> None:
 2. **Read the main table.** Probabilities per driver for each market. *Fair odds* are
    1 ÷ probability, i.e. the price without a bookmaker margin.
 3. **Race before and after qualifying.** Until qualifying is final the grid is estimated.
-   Afterwards the race view uses the actual grid and shows the change per driver.
+   Afterwards the race view uses the official FIA starting grid (grid penalties and pit-lane
+   starts included) or, until that's published, the qualifying result.
    Reload the page once qualifying has finished.
 4. **Inputs.** The rain probability is pre-filled from the forecast. Use *Adjustments* for
    grid penalties, upgrade packages or withdrawals.
 5. **Declared upgrades** lists the parts each team registered with the FIA. Shown for
    reference only: in testing, adding them did not improve the predictions.
 6. **Compare with bookmaker odds.** Open *Paste odds*, copy a market from the bookmaker's
-   page and paste it. A positive *edge* means the price is higher than the model's fair odds;
-   small edges are within the model's error.
+   page and paste it. Each bet gets an *edge*, a *cautious edge* (based on how often similar
+   predictions actually came true) and a verdict. Only **Value** bets stay positive even in
+   the cautious case. *Hits ~1 in* shows how rarely a bet comes in: long shots lose most of
+   the time even when the price is fair.
 7. **Check *Model accuracy*** at the bottom of each session before relying on a number.
 """)
 
@@ -296,6 +300,10 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
     circuit = info["circuitId"]
     quali_name = _quali_name(sessions, target)
     grid = _grid(sessions, target, year, rnd)
+    official = _official_grid(year, rnd, event["EventName"], target, sessions) \
+        if grid is not None else None
+    if official is not None:  # penalties and pit-lane starts change the order
+        grid = official["grid"]
     sq = _grid(sessions, "Sprint", year, rnd) if target == "Race" else None
     estimator = _grid_estimator(year, rnd) if sq is not None else None
     if estimator is None:
@@ -310,9 +318,16 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
 
     if quali_name:
         q_start = sessions[quali_name]
-        if grid is not None:
-            st.success(f"**Starting grid from the {quali_name} results.** The *before* column "
-                       "shows what the model predicted without it.")
+        if official is not None:
+            notes = "".join(f"\n- {n}" for n in official["notes"])
+            st.success(f"**Starting grid from the FIA {official['source']} starting grid**, "
+                       f"so grid penalties and pit-lane starts are included. The *before* "
+                       f"column shows the prediction without any grid.{notes}")
+        elif grid is not None:
+            st.success(f"**Starting grid from the {quali_name} results** (the FIA starting grid "
+                       "with penalties isn't published yet; edit *Grid* under Adjustments if "
+                       "you know of a penalty). The *before* column shows what the model "
+                       "predicted without it.")
         elif q_start > now:
             st.info(f"**{quali_name} starts {q_start:%a %d %b %H:%M} UTC.** Until then the grid "
                     "is estimated. Once the results are final this switches to the real grid "
@@ -360,6 +375,8 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
                           for d, t in zip(entries["driverId"], entries["constructorId"])])
     table = entries[["Driver", "Team"]].copy()
     table["Grid"] = table["Driver"].map(grid) if grid is not None else np.nan
+    if grid is not None:  # anyone missing from the official grid starts at the back
+        table["Grid"] = table["Grid"].fillna(len(table))
     table["Adjust (places)"] = 0.0
     table["Out"] = False
     with st.expander("Adjustments: grid penalties, upgrades, withdrawals", expanded=False):
@@ -419,7 +436,9 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
             "estimate": "before qualifying, grid estimated from Sprint Qualifying",
             "pre": "before qualifying"}[how]
 
+    recal, evidence = _betting_calibration(year, rnd, "race")
     result = model.summarise(pos, drivers)
+    result["Win"] = calibration.recalibrate_win(result["Win"].to_numpy(), recal)
     result.insert(1, "Team", list(entries["Team"][keep]))
     if how == "grid":  # show the real starting position, not the adjusted model input
         result.insert(2, "Grid", edited["Grid"].to_numpy()[keep].astype(int))
@@ -427,7 +446,9 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
         result.insert(2, "Est. grid", np.round(X["grid"].to_numpy()[keep], 1))
     if how == "grid" and grid is not None:
         # what qualifying changed: the same model without the real grid
-        before = model.summarise(run(pre_how)[2], drivers).set_index("Driver")
+        before = model.summarise(run(pre_how)[2], drivers)
+        before["Win"] = calibration.recalibrate_win(before["Win"].to_numpy(), recal)
+        before = before.set_index("Driver")
         result.insert(4, "Win before quali", result["Driver"].map(before["Win"]))
         result.insert(5, "Change", (result["Win"] - result["Win before quali"]) * 100)
     result["Fair odds (win)"] = (1 / result["Win"]).where(result["Win"] > 0.001)
@@ -483,9 +504,7 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
         fig.update_layout(title=dict(text="Win probability", font=dict(size=14)), height=380,
                           margin=dict(l=10, r=40, t=40, b=10), xaxis=dict(tickformat=".0%"))
         st.plotly_chart(fig, width="stretch", key=f"win_chart_{target}")
-        teams = (pd.DataFrame({"Team": entries["Team"][keep].values,
-                               "Win": (pos == 1).mean(0)}).groupby("Team")["Win"].sum()
-                 .sort_values(ascending=False).reset_index())
+        teams = (result.groupby("Team")["Win"].sum().sort_values(ascending=False).reset_index())
         teams["Fair odds"] = (1 / teams["Win"]).where(teams["Win"] > 0.001)
         st.markdown("**Winning team**")
         st.dataframe(_as_pct(teams.head(6), ["Win"]), hide_index=True, width="stretch",
@@ -493,7 +512,7 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
                                     "Fair odds": st.column_config.NumberColumn(format="%.1f")})
 
     _head_to_head(pos, drivers, entries[keep].reset_index(drop=True), key=target)
-    _value_check(result, MARKETS, key=target, entries=entries)
+    _value_check(result, MARKETS, key=target, entries=entries, evidence=evidence)
     _explain(fit, X[keep], feats[keep], entries[keep], wet_gain, rain, chaos, target, year, rnd,
              sq)
 
@@ -562,12 +581,41 @@ def parse_odds(text: str, entries: pd.DataFrame) -> dict[str, float]:
     return out
 
 
+_EVIDENCE_MARKET = {"Win": "first", "Pole": "first", "Podium": "top3", "Top 3": "top3"}
+
+
+def _bet_row(p: float, odds: float, ev: pd.DataFrame | None) -> dict:
+    """Edge with a realistic range: how often this kind of probability came true before."""
+    out = {"Hits ~1 in": round(1 / p) if p > 0 else np.nan, "Edge": p * odds - 1,
+           "Cautious edge": np.nan, "Past hit rate": "no backtest data", "Verdict": ""}
+    band = None if ev is None or ev.empty else ev[(ev["left"] <= p) & (p < ev["right"])]
+    if band is not None and len(band):
+        b = band.iloc[0]
+        # scale this driver's probability by how the band actually performed
+        p_lo = min(1.0, p * b["lo"] / b["predicted"]) if b["predicted"] > 0 else 0.0
+        out["Cautious edge"] = p_lo * odds - 1
+        out["Past hit rate"] = (f"{b['lo']:.1%}–{b['hi']:.1%} when the model said "
+                                f"{b['left']:.0%}–{min(b['right'], 1):.0%} "
+                                f"({int(b['hits'])} of {int(b['n'])})")
+    if out["Edge"] <= 0:
+        out["Verdict"] = "No value"
+    elif out["Cautious edge"] > 0:
+        out["Verdict"] = "Value"
+    else:
+        out["Verdict"] = "Uncertain"
+    return out
+
+
 def _value_check(result: pd.DataFrame, markets: list[str], key: str,
-                 entries: pd.DataFrame | None = None) -> None:
+                 entries: pd.DataFrame | None = None,
+                 evidence: dict[str, pd.DataFrame] | None = None) -> None:
     st.markdown("##### Compare with bookmaker odds")
-    st.caption("**Edge** is the expected return per €1 if the model's probability were correct; "
-               "positive = the bookmaker pays more than the model thinks fair. The model has its "
-               "own error (see the backtest), so small edges are noise.")
+    st.caption("**Edge** is the expected return per €1 *if* the model's probability is right. "
+               "**Cautious edge** uses the low end of how often the model's predictions in the "
+               "same probability range actually came true in the backtest. A bet is marked "
+               "**Value** only when even the cautious edge is positive. **Hits ~1 in** shows "
+               "how rarely it comes in: a fair 1-in-50 bet loses 49 times out of 50, so a "
+               "positive edge on a long shot only pays off over many bets.")
     parsed: dict[str, float] = {}
     paste_market = markets[0]
     if entries is not None:
@@ -608,14 +656,24 @@ def _value_check(result: pd.DataFrame, markets: list[str], key: str,
     bets = bets.assign(
         **{"Model prob.": [probs.at[d, m] for d, m in zip(bets["Driver"], bets["Market"])]})
     bets["Implied prob."] = 1 / bets["Odds"]
-    bets["Edge"] = bets["Model prob."] * bets["Odds"] - 1
-    bets = bets.sort_values("Edge", ascending=False)
+    extra = [_bet_row(p, o, (evidence or {}).get(_EVIDENCE_MARKET.get(m, "")))
+             for p, o, m in zip(bets["Model prob."], bets["Odds"], bets["Market"])]
+    bets = pd.concat([bets.reset_index(drop=True), pd.DataFrame(extra)], axis=1)
+    order = {"Value": 0, "Uncertain": 1, "No value": 2}
+    bets = bets.sort_values(["Verdict", "Edge"], key=lambda c: c.map(order) if c.name == "Verdict"
+                            else -c).reset_index(drop=True)
     margin = bets.groupby("Market")["Implied prob."].sum()
-    st.dataframe(bets.style.map(lambda v: "color: #1a9850; font-weight: 600" if v > 0.05 else
-                                ("color: #d73027" if v < 0 else ""), subset=["Edge"])
-                 .format({"Model prob.": "{:.1%}", "Implied prob.": "{:.1%}", "Edge": "{:+.0%}",
-                          "Odds": "{:.2f}"}),
-                 hide_index=True, width="stretch")
+    colour = {"Value": "color: #2fb380; font-weight: 600", "Uncertain": "color: #e0a526",
+              "No value": "color: #d73027"}
+    st.dataframe(
+        bets[["Driver", "Market", "Odds", "Model prob.", "Hits ~1 in", "Implied prob.", "Edge",
+              "Cautious edge", "Verdict", "Past hit rate"]]
+        .style.map(lambda v: colour.get(v, ""), subset=["Verdict"])
+        .format({"Model prob.": "{:.1%}", "Implied prob.": "{:.1%}", "Edge": "{:+.0%}",
+                 "Cautious edge": lambda v: "" if pd.isna(v) else f"{v:+.0%}",
+                 "Hits ~1 in": lambda v: "" if pd.isna(v) else f"{v:,.0f}", "Odds": "{:.2f}"}),
+        hide_index=True, width="stretch", height=ui.table_height(len(bets)),
+        row_height=ui.ROW_HEIGHT)
     full = {"Win": 1, "Pole": 1, "Podium": 3, "Top 3": 3, "Front row": 2}
     for m, total in margin.items():
         n = int((bets["Market"] == m).sum())
@@ -841,7 +899,8 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
                      column_config=_pct(teams, ["Pole"]))
 
     _head_to_head(pos, drivers, entries[keep].reset_index(drop=True), key="quali")
-    _value_check(result, QUALI_MARKETS, key="quali", entries=entries)
+    _value_check(result, QUALI_MARKETS, key="quali", entries=entries,
+                 evidence=_betting_calibration(year, rnd, "quali")[1])
 
     with st.expander("Model inputs"):
         st.markdown("**Weights the model learned** (fitted on past qualifying orders)")
@@ -1029,6 +1088,44 @@ def _calib_note(calib: dict, what: str) -> str:
         return f" · calibration from {calib['n']} past {what}: no correction needed"
     direction = "sharpened" if t < 1 else "widened"
     return f" · {direction} by {abs(1 / t - 1):.0%} based on {calib['n']} past {what}"
+
+
+@st.cache_resource(show_spinner=False, max_entries=6, ttl=600)
+def _betting_calibration(year: int, rnd: int, family: str):
+    """(win recalibration, {'first'|'top3': backtest band evidence}) from past events."""
+    _calibration_data(year, rnd)  # keeps the store up to date
+    events = [e for e in evaluate.load_store() if (e["season"], e["round"]) < (year, rnd)]
+    if family == "quali":
+        kinds, recal = ("quali",), None  # pole probabilities are already well calibrated
+    else:
+        kinds = ("race", "sprint")
+        recal = calibration.fit_win_recalibration(events, kinds)
+    evidence = {"first": calibration.band_evidence(events, kinds, "first", recal),
+                "top3": calibration.band_evidence(events, kinds, "top3")}
+    return (recal or (0.0, 1.0)), evidence
+
+
+@st.cache_data(show_spinner="Checking the FIA starting grid (penalties, pit-lane starts)…",
+               ttl=600)
+def _official_grid(year: int, rnd: int, event_name: str, target: str, sessions: dict):
+    """Official FIA starting grid as abbreviation -> slot, or None if not published yet."""
+    try:
+        doc = grid_docs.starting_grid(year, event_name, sprint=(target == "Sprint"))
+    except Exception:
+        return None
+    if doc is None:
+        return None
+    name = _quali_name(sessions, target)
+    try:
+        res = pdata.load_weekend_session(year, rnd, name, False, sessions[name]).results
+        number_to_abbr = dict(zip(res["DriverNumber"].astype(str), res["Abbreviation"]))
+    except Exception:
+        return None
+    grid = pd.Series({number_to_abbr[n]: slot for n, slot in doc["positions"].items()
+                      if n in number_to_abbr}, dtype=float)
+    if len(grid) < 10:
+        return None
+    return dict(grid=grid, source=doc["source"], notes=doc["notes"])
 
 
 def _with_result(result: pd.DataFrame, actual: pd.DataFrame) -> pd.DataFrame:
