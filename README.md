@@ -188,6 +188,16 @@ After qualifying, the race and sprint use the **official FIA starting grid**
 Until it's published the qualifying result is used; the grid can always be
 edited under *Adjustments*.
 
+## Deploy
+
+`docker compose up -d --build` runs the app behind Caddy (automatic HTTPS) for
+the domain in `DOMAIN` (default `f1.jeremyutomo.com`). The cache lives in
+`/var/lib/fastf1` on the host.
+
+On a fresh Ubuntu 24.04 server, `deploy/setup.sh` installs Docker, starts the
+app and enables a timer that redeploys `main` every time a new commit has
+passed CI (`.github/workflows/ci.yml`).
+
 ## Data sources and credits
 
 - [FastF1](https://github.com/theOehrly/Fast-F1) (MIT) for F1 timing data,

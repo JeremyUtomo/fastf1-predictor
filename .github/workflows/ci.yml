@@ -1,0 +1,43 @@
+name: CI
+
+# The server (deploy/auto-deploy.sh) deploys a commit on main only after
+# these checks pass.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install ruff
+      - run: ruff check --select F *.py
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t fastf1-predictor .
+      - name: Start container and wait for Streamlit
+        run: |
+          docker run -d --name app -p 8501:8501 fastf1-predictor
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8501/_stcore/health; then exit 0; fi
+            sleep 2
+          done
+          docker logs app
+          exit 1
+      - name: Import every module
+        run: |
+          docker exec app python -c "
+          import importlib
+          for m in ['ui', 'data', 'predict_data', 'model', 'evaluate', 'calibration',
+                    'grid_docs', 'upgrades', 'charts', 'predict_tab', 'track_record']:
+              importlib.import_module(m)
+          print('ok')"
