@@ -249,6 +249,8 @@ def render() -> None:
    the cautious case. *Hits ~1 in* shows how rarely a bet comes in: long shots lose most of
    the time even when the price is fair.
 7. **Check *Model accuracy*** at the bottom of each session before relying on a number.
+
+What the model uses and how much each factor weighs: [How it works](/how-it-works).
 """)
 
     c0, c1, c3 = st.columns([1, 4, 1])

@@ -9,6 +9,7 @@ import streamlit as st
 
 import charts
 import data
+import model_guide
 import predict_tab
 import track_record
 import ui
@@ -368,6 +369,11 @@ def track_record_page():
     track_record.render()
 
 
+def model_page():
+    ui.page_header("How it works")
+    model_guide.render()
+
+
 def session_page():
     sel = sidebar()
     key = (sel["year"], sel["round"], sel["session"], sel["telemetry"])
@@ -428,5 +434,6 @@ st.navigation([
     st.Page(season_page, title="Season", url_path="season"),
     st.Page(predictions_page, title="Predictions", url_path="predictions"),
     st.Page(track_record_page, title="Track record", url_path="track-record"),
+    st.Page(model_page, title="How it works", url_path="how-it-works"),
     st.Page(session_page, title="Session analysis", url_path="session"),
 ], position="top").run()

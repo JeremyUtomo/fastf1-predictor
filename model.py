@@ -40,6 +40,7 @@ FEATURE_INFO = {
     "grid_chaos": "Starting position × how much positions change at this circuit",
     "qgap_now": "This weekend's qualifying gap to pole in % (how dominant the pole lap was)",
 }
+HIGHER_IS_BETTER = {"driver_edge"}  # every other feature is a position or gap: lower = better
 MID_FIELD = 11.0
 HALF_LIFE = 3.0          # races, for recent form
 DRIVER_HALF_LIFE = 10.0  # races: driver skill changes slowly, the car quickly
@@ -242,8 +243,9 @@ class RankFit:
         return ((X[self.features].to_numpy(float) - self.mean) / self.std) @ self.beta
 
     def weight_table(self) -> pd.DataFrame:
-        # negative beta on a "lower is better" feature means it helps
-        return pd.DataFrame({"feature": self.features, "weight": -self.beta,
+        # weight > 0: a better value of the feature helps (most features are lower = better)
+        sign = np.array([1.0 if f in HIGHER_IS_BETTER else -1.0 for f in self.features])
+        return pd.DataFrame({"feature": self.features, "weight": sign * self.beta,
                              "meaning": [FEATURE_INFO[f] for f in self.features]})
 
 
