@@ -30,6 +30,9 @@ FP_BLEND = 0.5             # weight of this weekend's practice pace vs. recent q
 MARKETS = ["Win", "Podium", "Top 6", "Points (top 10)"]
 QUALI_MARKETS = ["Pole", "Front row", "Top 3", "Q3 (top 10)", "Q2 (top 15)"]
 PRACTICE_ORDER = ["Practice 3", "Practice 2", "Practice 1"]
+SURPRISE_PLACES = 6.0      # qualified this many places below the quali model's expectation…
+MATE_NORMAL = 3.0          # …while the teammate was within this of theirs
+PROBLEM_CAUSES = {"set no time", "stopped on track"}  # backtest: ~2 places better than predicted
 
 
 # ----------------------------------------------------------------- helpers
@@ -310,7 +313,7 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
         fit_post = fit_sprint
     circuit = info["circuitId"]
     quali_name = _quali_name(sessions, target)
-    grid = _grid(sessions, target, year, rnd)
+    grid = quali_pos = _grid(sessions, target, year, rnd)
     official = _official_grid(year, rnd, event["EventName"], target, sessions) \
         if grid is not None else None
     if official is not None:  # penalties and pit-lane starts change the order
@@ -347,6 +350,9 @@ def _render_race(target: str, event, sessions: dict, year: int, rnd: int, races:
             st.warning(f"**{quali_name} is running or its results aren't final yet**, so the "
                        "grid is still estimated. Re-checked every 5 minutes; reload the page "
                        "to update.")
+
+    if target == "Race" and quali_pos is not None:
+        _surprise_note(sessions, year, rnd, builder, circuit, entries, quali_pos)
 
     # ---------------------------------------------------------------- inputs
     st.markdown("##### Inputs")
@@ -839,6 +845,91 @@ def _weekend_signal(sessions: dict, year: int, rnd: int) -> tuple[str, object, s
     return "form", None, "no session yet"
 
 
+def _quali_X(entries: pd.DataFrame, builder, circuit: str, variant: str,
+             signal) -> pd.DataFrame:
+    """Qualifying model inputs: pre-weekend features plus this weekend's signal."""
+    X = pd.DataFrame([builder.features(d, t, circuit)
+                      for d, t in zip(entries["driverId"], entries["constructorId"])])
+    X["sq"] = X["fp"] = X["fp_gap"] = np.nan
+    if variant == "sprint quali":
+        X["sq"] = entries["Driver"].map(signal).to_numpy()
+    elif variant == "practice":
+        X["fp"] = entries["Driver"].map(signal["rank"]).to_numpy()
+        X["fp_gap"] = entries["Driver"].map(signal["gap"]).to_numpy()
+    return model.fill_missing(X, model.quali_features(variant))
+
+
+def _quali_causes(sessions: dict, year: int, rnd: int) -> dict:
+    """Abbreviation -> what went wrong in qualifying, from the timing data and the
+    race control messages (only drivers with something on record)."""
+    try:
+        session = pdata.load_weekend_session(year, rnd, "Qualifying", True,
+                                             sessions["Qualifying"])
+        res, msgs = session.results, session.race_control_messages["Message"].astype(str)
+    except Exception:
+        return {}
+    out = {}
+    for r in res.itertuples():
+        mine = msgs[msgs.str.contains(f"CAR {r.DriverNumber} (", regex=False)]
+        if pd.isna(r.Q1) and pd.isna(r.Q2) and pd.isna(r.Q3):
+            out[r.Abbreviation] = "set no time"
+        elif mine.str.contains("STOPPED").any():
+            out[r.Abbreviation] = "stopped on track"
+        elif mine.str.contains("SPUN|OFF TRACK", regex=True).any():
+            out[r.Abbreviation] = "spun or went off"
+        elif mine.str.contains("DELETED").any():
+            out[r.Abbreviation] = "had a lap deleted"
+    return out
+
+
+def _quali_surprises(sessions: dict, year: int, rnd: int, builder, circuit: str,
+                     entries: pd.DataFrame, quali_pos: pd.Series) -> pd.DataFrame:
+    """Drivers who stopped or set no time in qualifying, plus drivers who qualified far
+    below the qualifying model's expectation while their teammate didn't."""
+    variant, signal, _ = _weekend_signal(sessions, year, rnd)
+    X = _quali_X(entries, builder, circuit, variant, signal)
+    fit = _quali_fit(year, rnd, variant)
+    temp = _temperatures(year, rnd)["quali"]["temperature"]
+    expected = model.simulate_rank(fit.strength(X), np.zeros(len(X)), randomness=temp).mean(0)
+    df = pd.DataFrame({"Driver": entries["Driver"].values, "Team": entries["Team"].values,
+                       "Qualified": entries["Driver"].map(quali_pos).to_numpy(float),
+                       "Expected": expected})
+    df["shock"] = df["Qualified"] - df["Expected"]
+    mates = df.groupby("Team")["shock"]
+    df["mate_shock"] = (mates.transform("sum") - df["shock"]).where(mates.transform("size") == 2)
+    df["cause"] = df["Driver"].map(_quali_causes(sessions, year, rnd))
+    df["problem"] = df["cause"].isin(PROBLEM_CAUSES)
+    odd = (df["shock"] >= SURPRISE_PLACES) & (df["mate_shock"].abs() < MATE_NORMAL)
+    return df[df["problem"] | odd].sort_values("Qualified")
+
+
+def _surprise_note(sessions: dict, year: int, rnd: int, builder, circuit: str,
+                   entries: pd.DataFrame, quali_pos: pd.Series) -> None:
+    try:
+        odd = _quali_surprises(sessions, year, rnd, builder, circuit, entries, quali_pos)
+    except Exception:  # an extra hint only: never block the prediction
+        return
+    if odd.empty:
+        return
+    lines = "".join(
+        f"\n- **{r.Driver}** qualified P{r.Qualified:.0f} (expected about P{r.Expected:.0f})"
+        f" · {r.cause if isinstance(r.cause, str) else 'no cause in the race control messages'}"
+        for r in odd.itertuples())
+    text = "**Qualifying didn't go to plan for:**" + lines
+    if odd["problem"].any():
+        text += ("\n\nIn past races (2020–2025), drivers who stopped on track or set no time "
+                 "in qualifying finished about **2 places better** than this model predicted: "
+                 "it mostly sees the grid slot, not that the car is quicker than that. If it was "
+                 "a one-off problem that has been fixed, consider +1 to +2 places under "
+                 "*Adjustments*. That matters for points and head-to-heads; win and podium "
+                 "chances hardly change.")
+    if (~odd["problem"]).any():
+        text += ("\n\nFor other drops (a deleted lap, a spin, or no recorded cause) past "
+                 "races showed no reliable effect, so the prediction is best left as it is "
+                 "unless you know of a car problem.")
+    st.info(text)
+
+
 def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dict,
                   entries: pd.DataFrame) -> None:
     now = data.now_utc()
@@ -889,18 +980,9 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
     keep = ~edited["Out"].to_numpy()
     shift = edited["Adjust (places)"].to_numpy(float)
 
-    feats = model.quali_features(variant)
-    X = pd.DataFrame([builder.features(d, t, info["circuitId"])
-                      for d, t in zip(entries["driverId"], entries["constructorId"])])
     weekend_col = {"sprint quali": "sq",
                    "practice": model.CONFIG["quali"]["practice"]}.get(variant)
-    X["sq"] = X["fp"] = X["fp_gap"] = np.nan
-    if variant == "sprint quali":
-        X["sq"] = entries["Driver"].map(signal).to_numpy()
-    elif variant == "practice":
-        X["fp"] = entries["Driver"].map(signal["rank"]).to_numpy()
-        X["fp_gap"] = entries["Driver"].map(signal["gap"]).to_numpy()
-    X = model.fill_missing(X, feats)
+    X = _quali_X(entries, builder, info["circuitId"], variant, signal)
     X = _apply_shift(X, shift, extra_rank=("sq", "fp"))
     fit = _quali_fit(year, rnd, variant)
     drivers = list(entries["Driver"][keep])

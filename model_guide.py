@@ -218,6 +218,10 @@ def render() -> None:
   Predictions page for these.
 - Tested and **not** used because they didn't improve past predictions: upgrade counts,
   weighting recent seasons more, this weekend's pole gap, a team's retirement rate this season.
+- **A problem in qualifying** (stopped on track or no time set). Such drivers did finish about
+  2 places better than predicted, but mostly in the midfield. The model learns from the top
+  three finishers, so the extra input made win and podium predictions worse. The race page
+  flags these drivers instead, so you can adjust them yourself.
 """)
     st.caption("How well it has done is on the Track record page: saved predictions against "
                "results, and a backtest of every event since 2020.")
