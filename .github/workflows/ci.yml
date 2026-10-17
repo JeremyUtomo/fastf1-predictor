@@ -10,8 +10,12 @@ on:
 jobs:
   deploy-config:
     runs-on: ubuntu-latest
+    env:
+      WORLDS_DIR: ${{ github.workspace }}/../worlds-2026-predictor
     steps:
       - uses: actions/checkout@v4
+      - name: Clone the Worlds predictor (built from a local clone, like on the server)
+        run: git clone -q https://github.com/JeremyUtomo/worlds-2026-predictor.git "$WORLDS_DIR"
       - name: Compose file is valid
         run: docker compose config -q
       - name: Caddyfile is valid

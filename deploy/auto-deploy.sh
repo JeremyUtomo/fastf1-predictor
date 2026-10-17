@@ -3,18 +3,21 @@
 # Runs every 2 minutes from fastf1-deploy.timer (see setup.sh); pull-based,
 # so GitHub needs no SSH keys or AWS credentials.
 #
-# Also deploys the Worlds 2026 predictor (worlds-* services, built from
-# JeremyUtomo/worlds-2026-predictor) when its main branch has a new commit
-# with green CI.
+# Also deploys the Worlds 2026 predictor (worlds-* services, built from a local
+# clone of JeremyUtomo/worlds-2026-predictor) when its main branch has a new
+# commit with green CI.
 set -euo pipefail
 
 REPO=JeremyUtomo/fastf1-predictor
 DIR=/opt/fastf1-predictor
-SKIP=/var/lib/fastf1-deploy-skip  # last commit whose CI failed
+SKIP=/var/lib/fastf1-deploy-skip           # last commit whose CI failed
+DEPLOYED=/var/lib/fastf1-deployed          # last commit that came up successfully
 
 WORLDS_REPO=JeremyUtomo/worlds-2026-predictor
+WORLDS_DIR=/opt/worlds-2026-predictor
 WORLDS_DEPLOYED=/var/lib/fastf1-deploy-worlds       # Worlds commit currently deployed
 WORLDS_SKIP=/var/lib/fastf1-deploy-worlds-skip      # last Worlds commit whose CI failed
+export WORLDS_DIR
 
 # prints "pending", "failed" or "ok" for a commit's GitHub checks
 ci_state() {
@@ -34,16 +37,20 @@ ci_state() {
     fi
 }
 
+# puts the Worlds clone at a commit (cloning it the first time)
+worlds_checkout() {
+    [ -d "$WORLDS_DIR/.git" ] || git clone -q "https://github.com/$WORLDS_REPO.git" "$WORLDS_DIR"
+    git -C "$WORLDS_DIR" fetch -q origin main
+    git -C "$WORLDS_DIR" reset -q --hard "$1"
+}
+
 main() {
     cd "$DIR"
-    # keep the deployed Worlds commit when F1 redeploys
-    WORLDS_REF=$(cat "$WORLDS_DEPLOYED" 2>/dev/null || echo main)
-    export WORLDS_REF
-
     git fetch -q origin main
     local target
     target=$(git rev-parse origin/main)
-    [ "$target" = "$(git rev-parse HEAD)" ] && return 0
+    # compare with what last came up, not HEAD: a failed start is retried
+    [ "$target" = "$(cat "$DEPLOYED" 2>/dev/null)" ] && return 0
     [ "$target" = "$(cat "$SKIP" 2>/dev/null)" ] && return 0
 
     case "$(ci_state "$REPO" "$target")" in
@@ -58,7 +65,9 @@ main() {
 
     echo "deploying ${target:0:7}"
     git reset -q --hard "$target"
+    worlds_checkout "$(cat "$WORLDS_DEPLOYED" 2>/dev/null || echo origin/main)"
     docker compose up -d --build --remove-orphans
+    echo "$target" > "$DEPLOYED"
     docker image prune -f >/dev/null
 }
 
@@ -81,7 +90,8 @@ worlds() {
     esac
 
     echo "deploying Worlds ${target:0:7}"
-    WORLDS_REF=$target docker compose up -d --build worlds-app worlds-updater
+    worlds_checkout "$target"
+    docker compose up -d --build worlds-app worlds-updater
     echo "$target" > "$WORLDS_DEPLOYED"
     docker image prune -f >/dev/null
 }

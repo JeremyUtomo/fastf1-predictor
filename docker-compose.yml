@@ -22,10 +22,10 @@ services:
       - caddy_config:/config
 
   # Worlds 2026 predictor (github.com/JeremyUtomo/worlds-2026-predictor), served by
-  # the Caddy above. Built straight from GitHub at the commit that
-  # deploy/auto-deploy.sh pins in WORLDS_REF (only commits whose CI passed).
+  # the Caddy above. Built from a local clone that deploy/auto-deploy.sh keeps at
+  # the newest Worlds commit whose CI passed.
   worlds-app:
-    build: &worlds-build https://github.com/JeremyUtomo/worlds-2026-predictor.git#${WORLDS_REF:-main}
+    build: &worlds-build ${WORLDS_DIR:-/opt/worlds-2026-predictor}
     image: worlds-2026-predictor
     restart: unless-stopped
     environment:
