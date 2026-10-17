@@ -11,3 +11,16 @@
 	# Streamlit; websockets are proxied automatically
 	reverse_proxy app:8501
 }
+
+# Worlds 2026 predictor (the worlds-* services in docker-compose.yml)
+{$WORLDS_DOMAIN} {
+	encode zstd gzip
+
+	header X-Robots-Tag "noindex, nofollow"
+	respond /robots.txt <<TXT
+		User-agent: *
+		Disallow: /
+		TXT 200
+
+	reverse_proxy worlds-app:8501
+}

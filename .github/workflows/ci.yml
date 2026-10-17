@@ -8,6 +8,22 @@ on:
   pull_request:
 
 jobs:
+  deploy-config:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compose file is valid
+        run: docker compose config -q
+      - name: Caddyfile is valid
+        run: |
+          docker run --rm -e DOMAIN=f1.jeremyutomo.com -e WORLDS_DOMAIN=worlds.jeremyutomo.com \
+            -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.10-alpine \
+            caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: Deploy script parses
+        run: bash -n deploy/auto-deploy.sh
+      - name: Worlds image builds from GitHub
+        run: docker compose build worlds-app
+
   lint:
     runs-on: ubuntu-latest
     steps:
