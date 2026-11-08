@@ -198,6 +198,18 @@ On a fresh Ubuntu 24.04 server, `deploy/setup.sh` installs Docker, starts the
 app and enables a timer that redeploys `main` every time a new commit has
 passed CI (`.github/workflows/ci.yml`).
 
+### F1TV login
+
+Since October 2026, F1's live-timing archive (lap times, race control messages,
+session status) needs an F1TV Access subscription or higher. Results, standings
+and the model's history come from Jolpica and work without it. Practice pace,
+the qualifying-problem hint and Session analysis need the login.
+
+Locally, set `F1_USERNAME` and `F1_PASSWORD` in your shell, or let FastF1 ask in
+the terminal. On the server, put them in `/etc/fastf1/f1tv.env` (readable by
+root only); the app container reads that file and FastF1 signs in again by
+itself when its token expires (every 4 days).
+
 ## Data sources and credits
 
 - [FastF1](https://github.com/theOehrly/Fast-F1) (MIT) for F1 timing data,

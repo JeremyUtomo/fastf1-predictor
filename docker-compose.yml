@@ -2,6 +2,14 @@ services:
   app:
     build: .
     restart: unless-stopped
+    # F1TV login for F1's live-timing archive (lap times, messages): F1_USERNAME and
+    # F1_PASSWORD, kept on the server only (see README). Without it, results still load.
+    env_file:
+      - path: /etc/fastf1/f1tv.env
+        required: false
+    environment:
+      FASTF1_AUTH_METHOD: password
+      XDG_DATA_HOME: /data/xdg  # keeps FastF1's login token across rebuilds
     volumes:
       - /var/lib/fastf1:/data  # FastF1 cache, backtest store, prediction log
 

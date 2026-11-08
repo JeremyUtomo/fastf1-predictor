@@ -957,6 +957,12 @@ def _render_quali(event, sessions: dict, year: int, rnd: int, builder, info: dic
     n_fp = rows["fp"].notna().groupby([rows["season"], rows["round"]]).any().sum()
     k[2].metric("Trained on", f"{rows.groupby(['season', 'round']).ngroups} sessions",
                 f"{n_fp} with practice data", delta_color="off", delta_arrow="off")
+    practice_done = any(n.startswith("Practice") and s + pd.Timedelta(hours=1) < now
+                        for n, s in sessions.items())
+    if variant == "form" and practice_done:
+        st.warning("**Practice lap times couldn't be loaded**, so this prediction uses recent "
+                   "form only. F1's timing archive needs an F1TV login; if it's set up, the "
+                   "data may just not be published yet.")
     if variant == "practice" and source != "Practice 3":
         st.caption(f"Note: the model learned practice pace from Practice 3; {source} is used "
                    "as a stand-in, which is less representative (different programmes and "
