@@ -275,7 +275,7 @@ What the model uses and how much each factor weighs: [How it works](/how-it-work
         st.write("")
         if st.button("Refresh data", help="Re-download results; use after a session has finished."):
             for fn in (pdata.season_races, pdata.season_quali, pdata.season_sprints,
-                       pdata.weekend_session, pdata._fresh_session, _prepared, _fits,
+                       pdata._fresh_session, _prepared, _fits,
                        _grid_estimator, _quali_data, _quali_fit, _calibration_data,
                        _temperatures):
                 fn.clear()
@@ -1116,7 +1116,11 @@ def _results(sessions: dict, name: str, year: int, rnd: int,
     try:
         session = pdata.load_weekend_session(year, rnd, name, True, start)
         if pdata.is_settled(start) or pdata.session_finished(session):
-            res, laps = session.results, session.laps
+            res = session.results
+            try:
+                laps = session.laps
+            except Exception:  # lap timing can be missing while the results are fine
+                laps = None
     except Exception:
         pass
     if res is not None and res["Position"].notna().sum() >= 10:
@@ -1124,7 +1128,8 @@ def _results(sessions: dict, name: str, year: int, rnd: int,
             else pd.Series("", index=res.index)
         labels = [_STATUS_CODES.get(c) or (f"P{int(p)}" if pd.notna(p) else "No time")
                   for p, c in zip(res["Position"], codes)]
-        if name in ("Race", "Sprint") and not set(labels) & {"DNF", "DSQ", "DNS"} and len(laps):
+        if (name in ("Race", "Sprint") and not set(labels) & {"DNF", "DSQ", "DNS"}
+                and laps is not None and len(laps)):
             # classification not published yet (timing data only): a car that covered
             # less than 90% of the winner's distance is not classified
             done = laps.groupby("Driver")["LapNumber"].max()

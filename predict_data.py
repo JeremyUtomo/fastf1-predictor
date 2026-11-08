@@ -182,6 +182,9 @@ def forecast(lat: float, lon: float, start_utc: pd.Timestamp, hours: int = 2) ->
                 wind=float(window["wind_speed_10m"].mean()))
 
 
+NO_DATA_RETRY = 7 * 24 * 3600  # seconds before a session without lap data is tried again
+
+
 @st.cache_data(show_spinner=False, ttl=30 * 24 * 3600)
 def practice_pace(year: int, round_number: int, name: str) -> pd.DataFrame | None:
     """Best-lap rank and gap (%) per driver in a practice session, indexed by driverId.
@@ -191,7 +194,9 @@ def practice_pace(year: int, round_number: int, name: str) -> pd.DataFrame | Non
     store = _RANK_DIR / f"{year}_{round_number}_{name.replace(' ', '')}.csv"
     if store.exists():
         saved = pd.read_csv(store, index_col=0)
-        if "gap" in saved:  # files from before gaps were stored are refreshed below
+        # files from before gaps were stored are refreshed below; so is "no data" once
+        # it's a week old, since the cause may have been temporary (e.g. no F1TV login)
+        if "gap" in saved and (len(saved) or time.time() - store.stat().st_mtime < NO_DATA_RETRY):
             return saved if len(saved) else None
     pace = _practice_pace(year, round_number, name)
     (pace if pace is not None else pd.DataFrame(columns=["rank", "gap"])).to_csv(store)
